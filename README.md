@@ -30,11 +30,18 @@ By default all pages are processed. For testing you can limit the number of page
 python pdf_to_audio.py input.pdf output.mp3 --max-pages 1
 ```
 
-Models can be overridden using environment variables:
+You can select models via CLI flags:
 
 ```bash
-export TRANSCRIPTION_MODEL=gpt-5
-export TTS_MODEL=gpt-4o-mini-tts
+python pdf_to_audio.py input.pdf output.mp3 \
+  --transcription-model gpt-5 \
+  --tts-model gpt-4o-mini-tts
+```
+
+To transcribe only (skip TTS), use:
+
+```bash
+python pdf_to_audio.py input.pdf output.mp3 --skip-tts
 ```
 
 ## Testing with a Mocked API

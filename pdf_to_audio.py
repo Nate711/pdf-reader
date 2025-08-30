@@ -1,6 +1,5 @@
 import argparse
 import base64
-import json
 import os
 from datetime import datetime
 from pathlib import Path
@@ -85,57 +84,18 @@ def render_pdf_to_images(pdf_path, debug_folder=None):
     return images
 
 
-def _get(obj, key, default=None):
-    """Helper to get attribute or key from dict-like or object."""
-    if isinstance(obj, dict):
-        return obj.get(key, default)
-    if hasattr(obj, key):
-        return getattr(obj, key)
-    return default
-
-
-def _extract_text_from_response(response):
-    """Extract plain text from a Responses API response across known shapes."""
-    # 1) Legacy/mock path
-    text = _get(response, "output_text")
-    if isinstance(text, str) and text.strip():
-        return text.strip()
-
-    # 2) New Responses format with output -> [ { content: [ { type, text } ] } ]
-    output = _get(response, "output")
-    if isinstance(output, list):
-        texts = []
-        for item in output:
-            content = _get(item, "content")
-            if isinstance(content, list):
-                for block in content:
-                    btype = _get(block, "type")
-                    if btype in ("output_text", "text"):
-                        t = _get(block, "text")
-                        if isinstance(t, str):
-                            texts.append(t)
-        if texts:
-            return "".join(texts).strip()
-
-    # 3) Fallback: try a generic string cast if the SDK offers .text
-    maybe_text = _get(response, "text")
-    if isinstance(maybe_text, str) and maybe_text.strip():
-        return maybe_text.strip()
-
-    return ""
-
-
-def transcribe_page(image_bytes, client, model, page_num=None, log_data=None):
+def transcribe_page(image_bytes, client, model, page_num=None):
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
     response = client.responses.create(
         model=model,
+        reasoning={"effort": "low"},
         input=[
             {
                 "role": "user",
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "Transcribe the text from this page of a PDF in natural reading order. Return only the plain text.",
+                        "text": "Transcribe the text from this page of a PDF in natural reading order. Return only the plain text. Summarize figure and figure captions instead of transcribing them verbatim.",
                     },
                     {
                         "type": "input_image",
@@ -146,79 +106,11 @@ def transcribe_page(image_bytes, client, model, page_num=None, log_data=None):
         ],
     )
 
-    # Extract transcription text according to the new Responses format
-    transcription_text = _extract_text_from_response(response)
-
-    # Log response details if log_data is provided
-    if log_data is not None and page_num is not None:
-        # Pull canonical fields from Responses API
-        resp_id = _get(response, "id")
-        status = _get(response, "status")
-        created_at = _get(response, "created_at")
-        resp_model = _get(response, "model")
-        usage = _get(response, "usage")
-
-        # Normalize usage to the new input/output/total token names, with fallbacks
-        usage_log = None
-        if usage is not None:
-            input_tokens = _get(usage, "input_tokens")
-            output_tokens = _get(usage, "output_tokens")
-            total_tokens = _get(usage, "total_tokens")
-
-            # Backwards-compat for older naming
-            if input_tokens is None:
-                input_tokens = _get(usage, "prompt_tokens")
-            if output_tokens is None:
-                output_tokens = _get(usage, "completion_tokens")
-            if total_tokens is None and (input_tokens is not None or output_tokens is not None):
-                try:
-                    total_tokens = (input_tokens or 0) + (output_tokens or 0)
-                except Exception:
-                    total_tokens = None
-
-            usage_log = {
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
-                "total_tokens": total_tokens,
-            }
-
-        page_log = {
-            "page": page_num,
-            "timestamp": datetime.now().isoformat(),
-            "request_model": model,
-            "response": {
-                "id": resp_id,
-                "status": status,
-                "created_at": created_at,
-                "model": resp_model,
-            },
-        }
-
-        if usage_log is not None:
-            page_log["usage"] = usage_log
-
-            # Estimate cost (example placeholder rates; adjust as needed)
-            itok = usage_log.get("input_tokens") or 0
-            otok = usage_log.get("output_tokens") or 0
-            input_cost = (itok / 1000) * 0.01
-            output_cost = (otok / 1000) * 0.03
-            page_log["estimated_cost"] = {
-                "input": input_cost,
-                "output": output_cost,
-                "total": input_cost + output_cost,
-                "currency": "USD",
-            }
-
-        log_data["transcription_calls"].append(page_log)
-
-    return transcription_text
+    return response.output_text.strip()
 
 
-def text_to_speech(text, output_path, client, model, voice="alloy", log_data=None):
+def text_to_speech(text, output_path, client, model, voice="alloy"):
     output_file = Path(output_path)
-
-    # Create the TTS request
-    start_time = datetime.now()
 
     with client.audio.speech.with_streaming_response.create(
         model=model,
@@ -236,6 +128,21 @@ def main():
         "--max-pages", type=int, default=None, help="Limit number of pages for processing (for testing)"
     )
     parser.add_argument(
+        "--transcription-model",
+        default="gpt-5",
+        help="Model to use for page transcription (default: gpt-5)",
+    )
+    parser.add_argument(
+        "--tts-model",
+        default="gpt-4o-mini-tts",
+        help="Model to use for text-to-speech (default: gpt-4o-mini-tts)",
+    )
+    parser.add_argument(
+        "--skip-tts",
+        action="store_true",
+        help="Skip text-to-speech generation and only transcribe",
+    )
+    parser.add_argument(
         "--debug-folder",
         help="Optional folder to save rendered PDF pages as PNG images for debugging",
         default="debug_output",
@@ -243,15 +150,6 @@ def main():
     args = parser.parse_args()
 
     client = get_client()
-
-    # Initialize log data
-    log_data = {
-        "start_time": datetime.now().isoformat(),
-        "input_pdf": args.pdf,
-        "output_audio": args.output,
-        "transcription_calls": [],
-        "tts_call": None,
-    }
 
     images = render_pdf_to_images(args.pdf, debug_folder=args.debug_folder)
     texts = []
@@ -268,9 +166,8 @@ def main():
         page_text = transcribe_page(
             img,
             client,
-            model=os.getenv("TRANSCRIPTION_MODEL", "gpt-5"),
+            model=args.transcription_model,
             page_num=idx,
-            log_data=log_data if args.debug_folder else None,
         )
         texts.append(page_text)
 
@@ -288,41 +185,17 @@ def main():
             f.write(full_text)
         print(f"Saved full transcript to {full_text_path}")
 
-    print("Generating audio...")
-    text_to_speech(
-        full_text,
-        args.output,
-        client,
-        model=os.getenv("TTS_MODEL", "gpt-4o-mini-tts"),
-        log_data=log_data if args.debug_folder else None,
-    )
-
-    # Finalize and save log
-    if args.debug_folder:
-        log_data["end_time"] = datetime.now().isoformat()
-        log_data["total_duration"] = (
-            datetime.fromisoformat(log_data["end_time"]) - datetime.fromisoformat(log_data["start_time"])
-        ).total_seconds()
-
-        # Calculate total costs
-        total_transcription_cost = sum(
-            call.get("estimated_cost", {}).get("total", 0) for call in log_data["transcription_calls"]
+    if args.skip_tts:
+        print("Skipping TTS per --skip-tts flag.")
+    else:
+        print("Generating audio...")
+        text_to_speech(
+            full_text,
+            args.output,
+            client,
+            model=args.tts_model,
         )
-        total_tts_cost = log_data.get("tts_call", {}).get("estimated_cost", {}).get("total", 0)
-
-        log_data["total_estimated_cost"] = {
-            "transcription": total_transcription_cost,
-            "tts": total_tts_cost,
-            "total": total_transcription_cost + total_tts_cost,
-            "currency": "USD",
-        }
-
-        log_path = debug_path / "api_log.json"
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(log_data, f, indent=2)
-        print(f"Saved API log to {log_path}")
-
-    print(f"Saved audio to {args.output}")
+        print(f"Saved audio to {args.output}")
 
 
 if __name__ == "__main__":
