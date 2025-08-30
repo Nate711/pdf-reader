@@ -9,9 +9,9 @@ from typing import Any
 def transcribe_page(image_bytes: bytes, client: Any, model: str, page_num: int | None = None) -> str:
     """Use the OpenAI client to transcribe a single PDF page image."""
     b64_image = base64.b64encode(image_bytes).decode("utf-8")
+    kwargs = {"reasoning": {"effort": "low"}} if "gpt-5" in model else {}
     response = client.responses.create(
         model=model,
-        reasoning={"effort": "low"},
         input=[
             {
                 "role": "user",
@@ -34,6 +34,7 @@ def transcribe_page(image_bytes: bytes, client: Any, model: str, page_num: int |
                 ],
             }
         ],
+        **kwargs,
     )
 
     return response.output_text.strip()
