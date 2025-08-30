@@ -22,7 +22,10 @@ def transcribe_page(image_bytes: bytes, client: Any, model: str, page_num: int |
                             "Transcribe the text from this page of a PDF in natural reading order. "
                             "Return only the plain text. Summarize figure and figure captions instead "
                             "of transcribing them verbatim. Transcribe equations so that they can be "
-                            "read aloud naturally by a text-to-speech model. Abbreviate author list with et al"
+                            "read aloud naturally by a text-to-speech model. Abbreviate author list with et al. "
+                            "Skip non-text like arXiv:2502.04307v1 [cs.RO] 6 Feb 2025. "
+                            "Transcribe verbatim except for previously described exceptions."
+"
                         ),
                     },
                     {
