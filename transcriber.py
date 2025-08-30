@@ -25,7 +25,6 @@ def transcribe_page(image_bytes: bytes, client: Any, model: str, page_num: int |
                             "read aloud naturally by a text-to-speech model. Abbreviate author list with et al. "
                             "Skip non-text like arXiv:2502.04307v1 [cs.RO] 6 Feb 2025. "
                             "Transcribe verbatim except for previously described exceptions."
-"
                         ),
                     },
                     {
