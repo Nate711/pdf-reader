@@ -1,8 +1,8 @@
 import argparse
 import base64
 import os
-from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import fitz  # PyMuPDF
 from openai import OpenAI
@@ -95,7 +95,7 @@ def transcribe_page(image_bytes, client, model, page_num=None):
                 "content": [
                     {
                         "type": "input_text",
-                        "text": "Transcribe the text from this page of a PDF in natural reading order. Return only the plain text. Summarize figure and figure captions instead of transcribing them verbatim.",
+                        "text": "Transcribe the text from this page of a PDF in natural reading order. Return only the plain text. Summarize figure and figure captions instead of transcribing them verbatim. Transcribe equations so that they can be read aloud naturally by a text-to-speech model. Abbreviate author list with et al",
                     },
                     {
                         "type": "input_image",
@@ -109,13 +109,24 @@ def transcribe_page(image_bytes, client, model, page_num=None):
     return response.output_text.strip()
 
 
-def text_to_speech(text, output_path, client, model, voice="alloy"):
+def text_to_speech(text, output_path, client, model, voice="onyx"):
     output_file = Path(output_path)
 
     with client.audio.speech.with_streaming_response.create(
         model=model,
         voice=voice,
         input=text,
+        instructions="""Accent/Affect: Warm, refined, and gently instructive, reminiscent of a friendly professor.
+
+Tone: Calm, encouraging, and articulate, clearly describing each step with patience.
+
+Pacing: Fast and deliberate, pausing often to allow the listener to follow instructions comfortably.
+
+Emotion: Cheerful, supportive, and pleasantly enthusiastic; convey genuine enjoyment and appreciation of art.
+
+Pronunciation: Clearly articulate  terminology
+
+Personality Affect: Friendly and approachable with a hint of sophistication; speak confidently and reassuringly, guiding users through each step patiently and warmly.""",
     ) as response:
         response.stream_to_file(output_file)
 
@@ -152,30 +163,35 @@ def main():
     client = get_client()
 
     images = render_pdf_to_images(args.pdf, debug_folder=args.debug_folder)
-    texts = []
-    total_pages = len(images)
+    # Select pages to process (respect --max-pages)
+    pages = []
+    for idx, img in enumerate(images, start=1):
+        if args.max_pages is not None and idx > args.max_pages:
+            break
+        pages.append((idx, img))
+    total_pages = len(pages)
 
     if args.debug_folder:
         debug_path = Path(args.debug_folder)
         debug_path.mkdir(parents=True, exist_ok=True)
 
-    for idx, img in enumerate(images, start=1):
-        if args.max_pages is not None and idx > args.max_pages:
-            break
-        print(f"Transcribing page {idx}/{total_pages}...")
-        page_text = transcribe_page(
-            img,
-            client,
-            model=args.transcription_model,
-            page_num=idx,
-        )
-        texts.append(page_text)
-
-        if args.debug_folder:
-            text_path = debug_path / f"page_{idx:03d}.txt"
-            with open(text_path, "w", encoding="utf-8") as f:
-                f.write(page_text)
-            print(f"  Saved transcribed text to {text_path}")
+    # Transcribe pages in parallel (I/O bound -> threads)
+    texts = [None] * total_pages
+    if total_pages:
+        print(f"Transcribing {total_pages} page(s) in parallel...")
+    with ThreadPoolExecutor(max_workers=min(8, max(1, total_pages))) as ex:
+        future_to_idx = {
+            ex.submit(transcribe_page, img, client, args.transcription_model, idx): idx for idx, img in pages
+        }
+        for fut in as_completed(future_to_idx):
+            idx = future_to_idx[fut]
+            page_text = fut.result()
+            texts[idx - 1] = page_text
+            if args.debug_folder:
+                text_path = debug_path / f"page_{idx:03d}.txt"
+                with open(text_path, "w", encoding="utf-8") as f:
+                    f.write(page_text)
+                print(f"  Saved transcribed text to {text_path}")
 
     full_text = "\n".join(texts)
 
@@ -188,14 +204,42 @@ def main():
     if args.skip_tts:
         print("Skipping TTS per --skip-tts flag.")
     else:
-        print("Generating audio...")
-        text_to_speech(
-            full_text,
-            args.output,
-            client,
-            model=args.tts_model,
-        )
-        print(f"Saved audio to {args.output}")
+        # Generate per-page MP3s in parallel and a combined MP3
+        print("Generating per-page audio files in parallel...")
+        out_path = Path(args.output)
+        out_dir = out_path.parent
+        stem = out_path.stem
+
+        # Submit TTS jobs for non-empty pages
+        tasks = {}
+        nonempty_pages = [(idx, t) for idx, t in enumerate(texts, start=1) if t and t.strip()]
+        max_workers = min(8, max(1, len(nonempty_pages)))
+        page_files_map = {}
+        if nonempty_pages:
+            with ThreadPoolExecutor(max_workers=max_workers) as ex:
+                for idx, text in nonempty_pages:
+                    page_mp3 = out_dir / f"{stem}_page_{idx:03d}.mp3"
+                    fut = ex.submit(text_to_speech, text, page_mp3, client, args.tts_model)
+                    tasks[fut] = (idx, page_mp3)
+
+                for fut in as_completed(tasks):
+                    idx, page_mp3 = tasks[fut]
+                    # Any exceptions will raise here
+                    fut.result()
+                    page_files_map[idx] = page_mp3
+                    print(f"  Saved page {idx} audio to {page_mp3}")
+
+        # Combine all per-page MP3s into the final output by naive concatenation (in order)
+        if page_files_map:
+            ordered_pages = sorted(page_files_map.keys())
+            with open(out_path, "wb") as combined:
+                for idx in ordered_pages:
+                    p = page_files_map[idx]
+                    with open(p, "rb") as f:
+                        combined.write(f.read())
+            print(f"Saved combined audio to {args.output}")
+        else:
+            print("No page audio generated (all pages empty). Skipping combined file.")
 
 
 if __name__ == "__main__":
