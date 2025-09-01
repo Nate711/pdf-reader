@@ -5,6 +5,9 @@ import 'package:pdf_render/pdf_render.dart';
 import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle;
+// For web download of verification images
+// ignore: avoid_web_libraries_in_flutter, deprecated_member_use
+import 'dart:html' as html;
 
 // Firebase AI (Gemini) setup
 import 'package:http/http.dart' as http;
@@ -42,13 +45,49 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   PdfDocument? _doc;
   int _pageNumber = 1;
   bool _isTranscribing = false;
-  String? _transcribedText;
-  String? _costSummary;
+  bool _isBulkTranscribing = false;
+  int _bulkProgress = 0;
+  int _bulkTotal = 0;
+  List<String?>? _pageTexts;
+  List<String?>? _pageCostSummaries;
+  String? _bulkTotalCostSummary;
 
   @override
   void initState() {
     super.initState();
     _openDocument();
+  }
+
+  // Encodes a ui.Image to PNG bytes, optionally flipping vertically
+  // to correct the Web mirroring from pdf_render.
+  Future<Uint8List> _encodePngForLlm(ui.Image source, {required bool flipVertical}) async {
+    ui.Image? created;
+    try {
+      if (flipVertical) {
+        final recorder = ui.PictureRecorder();
+        final canvas = Canvas(recorder);
+        final h = source.height.toDouble();
+        // Flip vertically: translate down by height, then scale Y by -1.
+        canvas.translate(0, h);
+        canvas.scale(1, -1);
+        canvas.drawImage(source, Offset.zero, Paint());
+        final picture = recorder.endRecording();
+        created = await picture.toImage(source.width, source.height);
+      }
+
+      final imgToEncode = created ?? source;
+      final data = await imgToEncode.toByteData(format: ui.ImageByteFormat.png);
+      if (data == null) throw Exception('Failed to encode PNG');
+      return data.buffer.asUint8List();
+    } finally {
+      // Dispose images to free GPU/CPU memory.
+      if (created != null) {
+        created.dispose();
+        source.dispose();
+      } else {
+        source.dispose();
+      }
+    }
   }
 
   Future<void> _openDocument() async {
@@ -57,6 +96,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     setState(() {
       _doc = doc;
       _pageNumber = 1;
+      _pageTexts = List<String?>.filled(doc.pageCount, null);
+      _pageCostSummaries = List<String?>.filled(doc.pageCount, null);
+      _bulkTotalCostSummary = null;
     });
   }
 
@@ -67,8 +109,15 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   }
 
   Future<ui.Image> _renderPage(BuildContext context) async {
+    return _renderPageNumber(context, _pageNumber);
+  }
+
+  Future<ui.Image> _renderPageNumber(
+    BuildContext context,
+    int pageNumber,
+  ) async {
     final doc = _doc!;
-    final page = await doc.getPage(_pageNumber);
+    final page = await doc.getPage(pageNumber);
 
     // Render at a fixed 200 DPI.
     const dpi = 200.0;
@@ -103,26 +152,38 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
 
   Future<Uint8List> _currentPageAsPngBytes(BuildContext context) async {
     final img = await _renderPage(context);
-    final data = await img.toByteData(format: ui.ImageByteFormat.png);
-    if (data == null) throw Exception('Failed to encode PNG');
-    return data.buffer.asUint8List();
+    return _encodePngForLlm(img, flipVertical: kIsWeb);
+  }
+
+  Future<Uint8List> _pageAsPngBytes(
+    BuildContext context,
+    int pageNumber,
+  ) async {
+    final img = await _renderPageNumber(context, pageNumber);
+    return _encodePngForLlm(img, flipVertical: kIsWeb);
   }
 
   Future<void> _transcribeCurrentPage() async {
     setState(() {
       _isTranscribing = true;
-      _transcribedText = null;
     });
     try {
       final prompt = await _loadPrompt();
       if (!mounted) return;
 
       final png = await _currentPageAsPngBytes(context);
+      // Download the exact PNG sent to the LLM for orientation verification (Web only)
+      _savePngForVerification(png, _pageNumber);
       final result = await _geminiVisionGenerate(png, prompt);
       if (!mounted) return;
       setState(() {
-        _transcribedText = (result['text'] as String).trim();
-        _costSummary = result['costSummary'] as String?;
+        final text = (result['text'] as String).trim();
+        final cost = result['costSummary'] as String?;
+        final idx = _pageNumber - 1;
+        if (_pageTexts != null && idx >= 0 && idx < _pageTexts!.length) {
+          _pageTexts![idx] = text;
+          _pageCostSummaries![idx] = cost;
+        }
       });
     } on StateError catch (e) {
       if (!mounted) return;
@@ -141,6 +202,92 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
   }
 
+  Future<void> _transcribeAllPages() async {
+    final doc = _doc;
+    if (doc == null) return;
+    setState(() {
+      _isBulkTranscribing = true;
+      _bulkProgress = 0;
+      _bulkTotal = doc.pageCount;
+      // Initialize per-page outputs
+      _pageTexts = List<String?>.filled(doc.pageCount, null);
+      _pageCostSummaries = List<String?>.filled(doc.pageCount, null);
+      _bulkTotalCostSummary = null;
+    });
+    try {
+      final prompt = await _loadPrompt();
+      if (!mounted) return;
+
+      // Kick off all page transcriptions in parallel. Each future renders
+      // its page PNG and sends the HTTP request; we don't await until all
+      // requests are started.
+      final futures = <Future<Map<String, dynamic>>>[];
+      for (var p = 1; p <= doc.pageCount; p++) {
+        Future<Map<String, dynamic>> task() async {
+          final png = await _pageAsPngBytes(context, p);
+          // Download the exact PNG sent to the LLM for orientation verification (Web only)
+          _savePngForVerification(png, p);
+          final result = await _geminiVisionGenerate(png, prompt);
+          return {
+            'page': p,
+            'text': (result['text'] as String).trim(),
+            'totalCost': (result['totalCost'] as double?) ?? 0.0,
+            'costSummary': result['costSummary'] as String?,
+          };
+        }
+
+        final future = task().whenComplete(() {
+          if (!mounted) return;
+          setState(() {
+            _bulkProgress += 1;
+          });
+        });
+        futures.add(future);
+      }
+
+      // Wait for all to complete; results are in the same order as futures.
+      final results = await Future.wait(futures);
+
+      // Assemble final transcript in page order and compute total cost.
+      results.sort((a, b) => (a['page'] as int).compareTo(b['page'] as int));
+      double totalCost = 0.0;
+      for (final r in results) {
+        final p = r['page'] as int;
+        final text = r['text'] as String;
+        final pageCost = r['totalCost'] as double;
+        final costSummary = r['costSummary'] as String?;
+        if (_pageTexts != null) {
+          _pageTexts![p - 1] = text;
+        }
+        if (_pageCostSummaries != null) {
+          _pageCostSummaries![p - 1] = costSummary;
+        }
+        totalCost += pageCost;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _bulkTotalCostSummary = _formatTotalCost(totalCost, doc.pageCount);
+      });
+    } on StateError catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e.message)));
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Bulk transcription failed: $e')));
+    } finally {
+      if (mounted) {
+        setState(() {
+          _isBulkTranscribing = false;
+        });
+      }
+    }
+  }
+
   // Calls the Gemini REST API over HTTP with an image and prompt.
   Future<Map<String, dynamic>> _geminiVisionGenerate(
     Uint8List pngBytes,
@@ -154,7 +301,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
     );
 
     final payload = {
@@ -196,7 +343,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final content = candidates == null || candidates.isEmpty
         ? null
         : (candidates.first as Map<String, dynamic>)['content']
-            as Map<String, dynamic>?;
+              as Map<String, dynamic>?;
     final parts = content?['parts'] as List?;
     final buffer = StringBuffer();
     if (parts != null) {
@@ -207,10 +354,14 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final usage = data['usageMetadata'] as Map<String, dynamic>?;
-    final modelVersion = (data['modelVersion'] as String?) ?? 'gemini-2.5-flash';
+    final modelVersion =
+        (data['modelVersion'] as String?) ?? 'gemini-2.5-flash';
     String? costSummary;
+    double? totalCost;
     if (usage != null) {
-      costSummary = _formatCostSummary(usage, modelVersion);
+      final costs = _computeCosts(usage, modelVersion);
+      totalCost = costs['total'] as double;
+      costSummary = _formatCostSummaryFromCosts(costs, modelVersion);
     }
 
     return {
@@ -218,15 +369,35 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       'usage': usage,
       'modelVersion': modelVersion,
       'costSummary': costSummary,
+      'totalCost': totalCost,
     };
   }
 
-  String _formatCostSummary(Map<String, dynamic> usage, String modelVersion) {
+  // Saves the PNG passed to the LLM as a downloaded file (Web only).
+  void _savePngForVerification(Uint8List pngBytes, int pageNumber) {
+    if (!kIsWeb) return;
+    try {
+      final blob = html.Blob([pngBytes], 'image/png');
+      final url = html.Url.createObjectUrlFromBlob(blob);
+      final anchor = html.AnchorElement(href: url)
+        ..download = 'pdf_page_${pageNumber.toString().padLeft(3, '0')}.png'
+        ..style.display = 'none';
+      html.document.body?.append(anchor);
+      anchor.click();
+      anchor.remove();
+      html.Url.revokeObjectUrl(url);
+    } catch (_) {
+      // Best-effort: ignore failures (e.g., not running on the web).
+    }
+  }
+
+  Map<String, dynamic> _computeCosts(
+    Map<String, dynamic> usage,
+    String modelVersion,
+  ) {
     int intOf(dynamic v) => v is int
         ? v
-        : (v is num
-            ? v.toInt()
-            : int.tryParse(v?.toString() ?? '') ?? 0);
+        : (v is num ? v.toInt() : int.tryParse(v?.toString() ?? '') ?? 0);
 
     final promptTok = intOf(usage['promptTokenCount']);
     final candTok = intOf(usage['candidatesTokenCount']);
@@ -250,10 +421,34 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final outputCost = outTok * outputRatePerM / 1e6;
     final total = inputCost + outputCost;
 
-    String fmt(double v) => v < 0.01 ? v.toStringAsFixed(4) : v.toStringAsFixed(2);
+    return {
+      'promptTok': promptTok,
+      'outTok': outTok,
+      'inputCost': inputCost,
+      'outputCost': outputCost,
+      'total': total,
+    };
+  }
 
+  String _formatCostSummaryFromCosts(
+    Map<String, dynamic> costs,
+    String modelVersion,
+  ) {
+    String fmt(double v) =>
+        v < 0.01 ? v.toStringAsFixed(4) : v.toStringAsFixed(2);
+    final promptTok = costs['promptTok'] as int;
+    final outTok = costs['outTok'] as int;
+    final inputCost = (costs['inputCost'] as double);
+    final outputCost = (costs['outputCost'] as double);
+    final total = (costs['total'] as double);
     return 'Estimated cost: \$${fmt(total)} (input \$${fmt(inputCost)} for $promptTok tok, '
         'output \$${fmt(outputCost)} for $outTok tok; $modelVersion)';
+  }
+
+  String _formatTotalCost(double totalCost, int pages) {
+    String fmt(double v) =>
+        v < 0.01 ? v.toStringAsFixed(4) : v.toStringAsFixed(2);
+    return 'Estimated total cost across $pages page(s): \$${fmt(totalCost)}';
   }
 
   // Loads the LLM prompt from assets/prompt.md; throws if missing or empty.
@@ -280,10 +475,17 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         actions: [
           IconButton(
             tooltip: 'Transcribe current page (Gemini)',
-            onPressed: _doc == null || _isTranscribing
+            onPressed: _doc == null || _isTranscribing || _isBulkTranscribing
                 ? null
                 : () => _transcribeCurrentPage(),
             icon: const Icon(Icons.text_snippet_outlined),
+          ),
+          IconButton(
+            tooltip: 'Transcribe all pages',
+            onPressed: _doc == null || _isBulkTranscribing || _isTranscribing
+                ? null
+                : () => _transcribeAllPages(),
+            icon: const Icon(Icons.library_books_outlined),
           ),
         ],
       ),
@@ -291,7 +493,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           ? const Center(child: CircularProgressIndicator())
           : Column(
               children: [
-                // Page image
+                // Page image (carousel-like: one page at a time)
                 Expanded(
                   child: FutureBuilder<ui.Image>(
                     future: _renderPage(context),
@@ -299,15 +501,15 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                       if (snapshot.connectionState != ConnectionState.done) {
                         return const Center(child: CircularProgressIndicator());
                       }
-                      if (snapshot.hasError) {
+                      if (snapshot.hasError || !snapshot.hasData) {
                         return Center(
-                          child: Text('Render error: ${snapshot.error}'),
+                          child: Text(
+                            'Render error: ${snapshot.error ?? 'unknown'}',
+                          ),
                         );
                       }
                       final image = snapshot.data!;
                       Widget img = RawImage(image: image);
-                      // On Web, the rendered bitmap appears vertically mirrored.
-                      // Apply a vertical flip (scaleY: -1) to correct it.
                       if (kIsWeb) {
                         img = Transform(
                           alignment: Alignment.center,
@@ -323,30 +525,94 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                     },
                   ),
                 ),
+
                 if (_isTranscribing)
                   const LinearProgressIndicator(minHeight: 2),
-                if ((_transcribedText ?? '').isNotEmpty)
+                if (_isBulkTranscribing)
                   Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 8, 12, 8),
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        _transcribedText!,
-                        style: const TextStyle(fontSize: 14),
-                      ),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        LinearProgressIndicator(
+                          minHeight: 2,
+                          value: _bulkTotal > 0
+                              ? _bulkProgress / _bulkTotal
+                              : null,
+                        ),
+                        const SizedBox(height: 4),
+                        Text(
+                          'Transcribing all pages: $_bulkProgress/$_bulkTotal',
+                          style: const TextStyle(
+                            fontSize: 12,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ],
                     ),
                   ),
-                if ((_costSummary ?? '').isNotEmpty)
-                  Padding(
-                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
-                    child: Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        _costSummary!,
-                        style: const TextStyle(fontSize: 12, color: Colors.grey),
-                      ),
-                    ),
-                  ),
+
+                // Scrollable transcription box for current page
+                Builder(
+                  builder: (context) {
+                    final idx = (_pageNumber - 1).clamp(0, (doc.pageCount - 1));
+                    final text =
+                        (_pageTexts != null && idx < _pageTexts!.length)
+                        ? (_pageTexts![idx] ?? '')
+                        : '';
+                    final cost =
+                        (_pageCostSummaries != null &&
+                            idx < _pageCostSummaries!.length)
+                        ? (_pageCostSummaries![idx] ?? '')
+                        : '';
+                    return Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (text.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 6, 12, 6),
+                            child: SizedBox(
+                              height: 200,
+                              child: Scrollbar(
+                                child: SingleChildScrollView(
+                                  child: SelectableText(
+                                    text,
+                                    style: const TextStyle(fontSize: 14),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        if (cost.isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+                            child: Text(
+                              cost,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ),
+                        if ((_bulkTotalCostSummary ?? '').isNotEmpty)
+                          Padding(
+                            padding: const EdgeInsets.fromLTRB(12, 0, 12, 6),
+                            child: Text(
+                              _bulkTotalCostSummary!,
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Colors.grey,
+                              ),
+                            ),
+                          ),
+                      ],
+                    );
+                  },
+                ),
+
                 // Pager controls
                 Padding(
                   padding: const EdgeInsets.symmetric(
