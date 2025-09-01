@@ -12,6 +12,7 @@ import 'dart:html' as html;
 // Firebase AI (Gemini) setup
 import 'package:http/http.dart' as http;
 import 'dart:convert';
+import 'package:audioplayers/audioplayers.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -52,12 +53,29 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   List<String?>? _pageTexts;
   List<String?>? _pageCostSummaries;
   String? _bulkTotalCostSummary;
-  String? _lastAudioObjectUrl; // Web: revoke when replaced
+  // Audio player (cross-platform)
+  late final AudioPlayer _audioPlayer;
+  Duration _audioPosition = Duration.zero;
+  Duration _audioDuration = Duration.zero;
+  PlayerState _audioState = PlayerState.stopped;
 
   @override
   void initState() {
     super.initState();
     _openDocument();
+    _audioPlayer = AudioPlayer();
+    _audioPlayer.onDurationChanged.listen((d) {
+      if (!mounted) return;
+      setState(() => _audioDuration = d);
+    });
+    _audioPlayer.onPositionChanged.listen((p) {
+      if (!mounted) return;
+      setState(() => _audioPosition = p);
+    });
+    _audioPlayer.onPlayerStateChanged.listen((s) {
+      if (!mounted) return;
+      setState(() => _audioState = s);
+    });
   }
 
   // Encodes a ui.Image to PNG bytes, optionally flipping vertically
@@ -110,6 +128,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   @override
   void dispose() {
     _doc?.dispose();
+    _audioPlayer.dispose();
     super.dispose();
   }
 
@@ -229,8 +248,8 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     try {
       final audio = await _geminiTts(text);
       final bytes = audio['bytes'] as Uint8List;
-      final mime = (audio['mimeType'] as String?) ?? 'audio/wav';
-      _playAudioWeb(bytes, mime);
+      await _audioPlayer.stop();
+      await _audioPlayer.play(BytesSource(bytes));
     } catch (e) {
       if (!mounted) return;
       ScaffoldMessenger.of(
@@ -239,6 +258,19 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     } finally {
       if (mounted) setState(() => _isSpeaking = false);
     }
+  }
+
+  // Audio controls for the in-app player (audioplayers)
+  Future<void> _audioTogglePlayPause() async {
+    if (_audioState == PlayerState.playing) {
+      await _audioPlayer.pause();
+    } else {
+      await _audioPlayer.resume();
+    }
+  }
+
+  Future<void> _audioSeek(double seconds) async {
+    await _audioPlayer.seek(Duration(milliseconds: (seconds * 1000).round()));
   }
 
   Future<void> _transcribeAllPages() async {
@@ -536,59 +568,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     return out;
   }
 
-  void _playAudioWeb(Uint8List bytes, String mimeType) {
-    if (!kIsWeb) {
-      // Non-web: best-effort download until a cross-platform audio player is added
-      _downloadBytes(bytes, 'tts.wav', mimeType);
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Saved TTS audio (no in-app player on this platform).'),
-        ),
-      );
-      return;
-    }
-    try {
-      if (_lastAudioObjectUrl != null) {
-        html.Url.revokeObjectUrl(_lastAudioObjectUrl!);
-        _lastAudioObjectUrl = null;
-      }
-      final blob = html.Blob([bytes], mimeType);
-      final url = html.Url.createObjectUrlFromBlob(blob);
-      _lastAudioObjectUrl = url;
-      final audio = html.AudioElement(url)
-        ..autoplay = true
-        ..controls = false
-        ..loop = false;
-      // Add element to DOM to ensure playback policies are satisfied after user gesture
-      html.document.body?.append(audio);
-      audio.onEnded.listen((_) {
-        audio.remove();
-        if (_lastAudioObjectUrl != null) {
-          html.Url.revokeObjectUrl(_lastAudioObjectUrl!);
-          _lastAudioObjectUrl = null;
-        }
-      });
-      audio.play();
-    } catch (e) {
-      // Fallback: download if playback fails
-      _downloadBytes(bytes, 'tts.wav', mimeType);
-    }
-  }
-
-  void _downloadBytes(Uint8List data, String filename, String mime) {
-    if (!kIsWeb) return;
-    try {
-      final blob = html.Blob([data], mime);
-      final url = html.Url.createObjectUrlFromBlob(blob);
-      final anchor = html.AnchorElement(href: url)
-        ..download = filename
-        ..style.display = 'none';
-      html.document.body?.append(anchor);
-      anchor.click();
-      anchor.remove();
-      html.Url.revokeObjectUrl(url);
-    } catch (_) {}
-  }
+  // Download helper (currently unused)
 
   // Saves the PNG passed to the LLM as a downloaded file (Web only).
   void _savePngForVerification(Uint8List pngBytes, int pageNumber) {
@@ -666,6 +646,13 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     String fmt(double v) =>
         v < 0.01 ? v.toStringAsFixed(4) : v.toStringAsFixed(2);
     return 'Estimated total cost across $pages page(s): \$${fmt(totalCost)}';
+  }
+
+  String _fmtTime(Duration d) {
+    final totalSecs = d.inSeconds;
+    final m = (totalSecs ~/ 60).toString().padLeft(1, '0');
+    final s = (totalSecs % 60).toString().padLeft(2, '0');
+    return '$m:$s';
   }
 
   // Loads the LLM prompt from assets/prompt.md; throws if missing or empty.
@@ -843,25 +830,70 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                     vertical: 8,
                     horizontal: 12,
                   ),
-                  child: Row(
-                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
-                      Text('Page $_pageNumber of ${doc.pageCount}'),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text('Page $_pageNumber of ${doc.pageCount}'),
+                          Row(
+                            children: [
+                              IconButton(
+                                tooltip: 'Previous',
+                                onPressed: _pageNumber > 1
+                                    ? () => _goToPage(_pageNumber - 1)
+                                    : null,
+                                icon: const Icon(Icons.chevron_left),
+                              ),
+                              IconButton(
+                                tooltip: 'Next',
+                                onPressed: _pageNumber < doc.pageCount
+                                    ? () => _goToPage(_pageNumber + 1)
+                                    : null,
+                                icon: const Icon(Icons.chevron_right),
+                              ),
+                            ],
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      // Audio player controls
                       Row(
                         children: [
                           IconButton(
-                            tooltip: 'Previous',
-                            onPressed: _pageNumber > 1
-                                ? () => _goToPage(_pageNumber - 1)
+                            tooltip: _audioState == PlayerState.playing ? 'Pause' : 'Play',
+                            onPressed: (_audioDuration > Duration.zero)
+                                ? _audioTogglePlayPause
                                 : null,
-                            icon: const Icon(Icons.chevron_left),
+                            icon: Icon(
+                              _audioState == PlayerState.playing
+                                  ? Icons.pause
+                                  : Icons.play_arrow,
+                            ),
                           ),
-                          IconButton(
-                            tooltip: 'Next',
-                            onPressed: _pageNumber < doc.pageCount
-                                ? () => _goToPage(_pageNumber + 1)
-                                : null,
-                            icon: const Icon(Icons.chevron_right),
+                          Expanded(
+                            child: Slider(
+                              value: _audioPosition.inMilliseconds
+                                  .clamp(0, _audioDuration.inMilliseconds)
+                                  .toDouble(),
+                              min: 0,
+                              max: (_audioDuration.inMilliseconds == 0
+                                      ? 1
+                                      : _audioDuration.inMilliseconds)
+                                  .toDouble(),
+                              onChanged: (_audioDuration > Duration.zero)
+                                  ? (v) => _audioSeek(v / 1000.0)
+                                  : null,
+                            ),
+                          ),
+                          SizedBox(
+                            width: 110,
+                            child: Text(
+                              '${_fmtTime(_audioPosition)} / ${_fmtTime(_audioDuration)}',
+                              textAlign: TextAlign.right,
+                              style: const TextStyle(fontSize: 12),
+                            ),
                           ),
                         ],
                       ),
