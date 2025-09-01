@@ -60,7 +60,10 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
 
   // Encodes a ui.Image to PNG bytes, optionally flipping vertically
   // to correct the Web mirroring from pdf_render.
-  Future<Uint8List> _encodePngForLlm(ui.Image source, {required bool flipVertical}) async {
+  Future<Uint8List> _encodePngForLlm(
+    ui.Image source, {
+    required bool flipVertical,
+  }) async {
     ui.Image? created;
     try {
       if (flipVertical) {
@@ -301,7 +304,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
     );
 
     final payload = {

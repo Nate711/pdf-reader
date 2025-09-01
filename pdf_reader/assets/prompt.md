@@ -16,12 +16,14 @@ Extract the readable text from a single PDF page image in natural reading order 
 6. Convert ligatures (e.g., “ﬁ”, “ﬂ”) to normal letters.
 7. Remove repeating headers/footers, page numbers, running titles, and watermarks.
 8. Bibliography/citations: Ignore.
-9. Figures, tables, and complex math:
-   - Summarize content succinctly rather than attempting verbatim OCR of dense layouts.
-   - Summarize visible captions in your own words when possible.
+9. Figures, tables, complex math, and algorithms:
+   - Summarize figure content and caption into succint one sentence summary.
+   - Summarize tables by transcribing the point of the table in one sentence.
+   - Summarize algorithms and complex math into one sentence.
 10. Equations: express in readable natural language suitable for TTS (e.g., “x squared plus y squared equals z squared”), not LaTeX.
-11. Abbreviate author lists with “[first author] et al.” 
+11. Abbreviate author lists with “[first author] et al.” Ignore author affiliations like "BAIR, UC Berkeley"
 12. Exclude obvious boilerplate like submission timestamps or repository IDs unless central to the text’s meaning.
+13. References: omit all reference entries and report only the number of references in the section.
 
 ## Special Handling
 - Bulleted/numbered lists: keep list structure as plain text (use “- ” or numbers) when clear.
