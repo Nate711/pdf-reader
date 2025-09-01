@@ -1,8 +1,10 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:flutter/foundation.dart' as foundation;
 import 'package:pdf_render/pdf_render.dart';
 import 'dart:ui' as ui;
 import 'dart:typed_data';
+import 'package:flutter/services.dart' show rootBundle;
 
 // Firebase AI (Gemini) setup
 import 'package:http/http.dart' as http;
@@ -111,13 +113,8 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       _transcribedText = null;
     });
     try {
-      final prompt =
-          'Transcribe the text from this page of a PDF in natural reading order. '
-          'Return only the plain text. Summarize figure and figure captions instead '
-          'of transcribing them verbatim. Transcribe equations so that they can be '
-          'read aloud naturally by a text-to-speech model. Abbreviate author list with et al. '
-          'Skip non-text like arXiv:2502.04307v1 [cs.RO] 6 Feb 2025. '
-          'Transcribe verbatim except for previously described exceptions.';
+      final prompt = await _loadPrompt();
+      if (!mounted) return;
 
       final png = await _currentPageAsPngBytes(context);
       final text = await _geminiVisionGenerate(png, prompt);
@@ -155,7 +152,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
     );
 
     final payload = {
@@ -181,6 +178,12 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       body: jsonEncode(payload),
     );
 
+    if (foundation.kDebugMode) {
+      foundation.debugPrint('Gemini HTTP response status: ${resp.statusCode}');
+      foundation.debugPrint('Gemini HTTP response headers: ${resp.headers}');
+      foundation.debugPrint('Gemini HTTP response body: ${resp.body}');
+    }
+
     if (resp.statusCode != 200) {
       throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
     }
@@ -200,6 +203,25 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       if (t is String && t.isNotEmpty) buffer.write(t);
     }
     return buffer.toString();
+  }
+
+  // Loads the LLM prompt from assets/prompt.md; falls back to a default string
+  // compatible with the previous inline prompt.
+  Future<String> _loadPrompt() async {
+    const fallback =
+        'Transcribe the text from this page of a PDF in natural reading order. '
+        'Return only the plain text. Summarize figure and figure captions instead '
+        'of transcribing them verbatim. Transcribe equations so that they can be '
+        'read aloud naturally by a text-to-speech model. Abbreviate author list with et al. '
+        'Skip non-text like arXiv:2502.04307v1 [cs.RO] 6 Feb 2025. '
+        'Transcribe verbatim except for previously described exceptions.';
+    try {
+      final s = await rootBundle.loadString('assets/prompt.md');
+      final trimmed = s.trim();
+      return trimmed.isEmpty ? fallback : trimmed;
+    } catch (_) {
+      return fallback;
+    }
   }
 
   @override
