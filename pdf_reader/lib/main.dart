@@ -43,6 +43,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   int _pageNumber = 1;
   bool _isTranscribing = false;
   String? _transcribedText;
+  String? _costSummary;
 
   @override
   void initState() {
@@ -117,10 +118,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       if (!mounted) return;
 
       final png = await _currentPageAsPngBytes(context);
-      final text = await _geminiVisionGenerate(png, prompt);
+      final result = await _geminiVisionGenerate(png, prompt);
       if (!mounted) return;
       setState(() {
-        _transcribedText = text.trim();
+        _transcribedText = (result['text'] as String).trim();
+        _costSummary = result['costSummary'] as String?;
       });
     } on StateError catch (e) {
       if (!mounted) return;
@@ -140,7 +142,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   }
 
   // Calls the Gemini REST API over HTTP with an image and prompt.
-  Future<String> _geminiVisionGenerate(
+  Future<Map<String, dynamic>> _geminiVisionGenerate(
     Uint8List pngBytes,
     String prompt,
   ) async {
@@ -191,18 +193,67 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final Map<String, dynamic> data =
         jsonDecode(resp.body) as Map<String, dynamic>;
     final candidates = data['candidates'] as List?;
-    if (candidates == null || candidates.isEmpty) return '';
-    final content =
-        (candidates.first as Map<String, dynamic>)['content']
+    final content = candidates == null || candidates.isEmpty
+        ? null
+        : (candidates.first as Map<String, dynamic>)['content']
             as Map<String, dynamic>?;
     final parts = content?['parts'] as List?;
-    if (parts == null) return '';
     final buffer = StringBuffer();
-    for (final p in parts) {
-      final t = (p as Map)['text'];
-      if (t is String && t.isNotEmpty) buffer.write(t);
+    if (parts != null) {
+      for (final p in parts) {
+        final t = (p as Map)['text'];
+        if (t is String && t.isNotEmpty) buffer.write(t);
+      }
     }
-    return buffer.toString();
+
+    final usage = data['usageMetadata'] as Map<String, dynamic>?;
+    final modelVersion = (data['modelVersion'] as String?) ?? 'gemini-2.5-flash';
+    String? costSummary;
+    if (usage != null) {
+      costSummary = _formatCostSummary(usage, modelVersion);
+    }
+
+    return {
+      'text': buffer.toString(),
+      'usage': usage,
+      'modelVersion': modelVersion,
+      'costSummary': costSummary,
+    };
+  }
+
+  String _formatCostSummary(Map<String, dynamic> usage, String modelVersion) {
+    int intOf(dynamic v) => v is int
+        ? v
+        : (v is num
+            ? v.toInt()
+            : int.tryParse(v?.toString() ?? '') ?? 0);
+
+    final promptTok = intOf(usage['promptTokenCount']);
+    final candTok = intOf(usage['candidatesTokenCount']);
+    final thoughtsTok = intOf(usage['thoughtsTokenCount']);
+    final outTok = candTok + thoughtsTok;
+
+    double inputRatePerM;
+    double outputRatePerM;
+
+    if (modelVersion.contains('2.5-pro')) {
+      // Tiered pricing based on token counts (<=200k vs >200k)
+      inputRatePerM = (promptTok <= 200000) ? 1.25 : 2.50;
+      outputRatePerM = (outTok <= 200000) ? 10.00 : 15.00;
+    } else {
+      // 2.5 Flash (text/image/video). Audio not used here.
+      inputRatePerM = 0.30;
+      outputRatePerM = 2.50;
+    }
+
+    final inputCost = promptTok * inputRatePerM / 1e6;
+    final outputCost = outTok * outputRatePerM / 1e6;
+    final total = inputCost + outputCost;
+
+    String fmt(double v) => v < 0.01 ? v.toStringAsFixed(4) : v.toStringAsFixed(2);
+
+    return 'Estimated cost: \$${fmt(total)} (input \$${fmt(inputCost)} for $promptTok tok, '
+        'output \$${fmt(outputCost)} for $outTok tok; $modelVersion)';
   }
 
   // Loads the LLM prompt from assets/prompt.md; falls back to a default string
@@ -286,6 +337,17 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                       child: Text(
                         _transcribedText!,
                         style: const TextStyle(fontSize: 14),
+                      ),
+                    ),
+                  ),
+                if ((_costSummary ?? '').isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 0, 12, 8),
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        _costSummary!,
+                        style: const TextStyle(fontSize: 12, color: Colors.grey),
                       ),
                     ),
                   ),
