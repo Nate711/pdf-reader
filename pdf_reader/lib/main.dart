@@ -45,12 +45,14 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   PdfDocument? _doc;
   int _pageNumber = 1;
   bool _isTranscribing = false;
+  bool _isSpeaking = false;
   bool _isBulkTranscribing = false;
   int _bulkProgress = 0;
   int _bulkTotal = 0;
   List<String?>? _pageTexts;
   List<String?>? _pageCostSummaries;
   String? _bulkTotalCostSummary;
+  String? _lastAudioObjectUrl; // Web: revoke when replaced
 
   @override
   void initState() {
@@ -202,6 +204,40 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       if (mounted) {
         setState(() => _isTranscribing = false);
       }
+    }
+  }
+
+  Future<void> _speakCurrentPage() async {
+    final doc = _doc;
+    if (doc == null) return;
+    final idx = (_pageNumber - 1).clamp(0, (doc.pageCount - 1));
+    final text = (_pageTexts != null && idx < _pageTexts!.length)
+        ? (_pageTexts![idx] ?? '')
+        : '';
+    if (text.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'No transcription available for this page. Transcribe first.',
+          ),
+        ),
+      );
+      return;
+    }
+    setState(() => _isSpeaking = true);
+    try {
+      final audio = await _geminiTts(text);
+      final bytes = audio['bytes'] as Uint8List;
+      final mime = (audio['mimeType'] as String?) ?? 'audio/wav';
+      _playAudioWeb(bytes, mime);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('TTS failed: $e')));
+    } finally {
+      if (mounted) setState(() => _isSpeaking = false);
     }
   }
 
@@ -376,6 +412,184 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     };
   }
 
+  // Gemini TTS over HTTP. Returns { bytes: Uint8List, mimeType: String }
+  Future<Map<String, dynamic>> _geminiTts(String text) async {
+    const apiKey = String.fromEnvironment('GENAI_API_KEY');
+    if (apiKey.isEmpty) {
+      throw StateError(
+        'GENAI_API_KEY not set. Run with --dart-define=GENAI_API_KEY=YOUR_KEY',
+      );
+    }
+    // Use preview TTS-capable model.
+    final url = Uri.parse(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey',
+    );
+    final payload = {
+      'contents': [
+        {
+          'parts': [
+            {'text': text},
+          ],
+        },
+      ],
+      'generationConfig': {
+        'responseModalities': ['AUDIO'],
+        'speechConfig': {
+          'voiceConfig': {
+            'prebuiltVoiceConfig': {'voiceName': 'Kore'},
+          },
+        },
+      },
+      'model': 'gemini-2.5-flash-preview-tts',
+    };
+    if (foundation.kDebugMode) {
+      foundation.debugPrint('Gemini TTS request: ${jsonEncode(payload)}');
+    }
+    final resp = await http.post(
+      url,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(payload),
+    );
+    if (foundation.kDebugMode) {
+      foundation.debugPrint('Gemini TTS status: ${resp.statusCode}');
+      foundation.debugPrint('Gemini TTS body: ${resp.body}');
+    }
+    if (resp.statusCode != 200) {
+      throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
+    }
+    final Map<String, dynamic> data =
+        jsonDecode(resp.body) as Map<String, dynamic>;
+    final candidates = data['candidates'] as List?;
+    if (candidates == null || candidates.isEmpty) {
+      throw Exception('No audio in response');
+    }
+    final content =
+        (candidates.first as Map<String, dynamic>)['content']
+            as Map<String, dynamic>;
+    final parts = content['parts'] as List?;
+    if (parts == null || parts.isEmpty) {
+      throw Exception('No parts in response');
+    }
+    for (final p in parts) {
+      final mp = p as Map<String, dynamic>;
+      // REST may return camelCase inlineData
+      final inline =
+          (mp['inlineData'] as Map<String, dynamic>?) ??
+          (mp['inline_data'] as Map<String, dynamic>?);
+      if (inline != null) {
+        final base64 = inline['data'] as String?;
+        if (base64 != null) {
+          final pcm = Uint8List.fromList(const Base64Decoder().convert(base64));
+          final wav = _pcmToWav(
+            pcm,
+            sampleRate: 24000,
+            channels: 1,
+            bitsPerSample: 16,
+          );
+          return {'bytes': wav, 'mimeType': 'audio/wav'};
+        }
+      }
+    }
+    throw Exception('No inline audio found');
+  }
+
+  // Wrap raw PCM (s16le) into a WAV container for easy playback in browsers.
+  Uint8List _pcmToWav(
+    Uint8List pcm, {
+    required int sampleRate,
+    required int channels,
+    required int bitsPerSample,
+  }) {
+    final byteRate = sampleRate * channels * (bitsPerSample ~/ 8);
+    final blockAlign = channels * (bitsPerSample ~/ 8);
+    final totalDataLen = pcm.length;
+    final riffChunkSize = 36 + totalDataLen;
+    final header = Uint8List(44);
+    final b = header.buffer;
+    void writeString(int offset, String s) {
+      final bytes = s.codeUnits;
+      header.setRange(offset, offset + bytes.length, bytes);
+    }
+
+    void writeUint32LE(int offset, int value) =>
+        ByteData.view(b).setUint32(offset, value, Endian.little);
+    void writeUint16LE(int offset, int value) =>
+        ByteData.view(b).setUint16(offset, value, Endian.little);
+
+    writeString(0, 'RIFF');
+    writeUint32LE(4, riffChunkSize);
+    writeString(8, 'WAVE');
+    writeString(12, 'fmt ');
+    writeUint32LE(16, 16); // PCM fmt chunk size
+    writeUint16LE(20, 1); // audio format PCM
+    writeUint16LE(22, channels);
+    writeUint32LE(24, sampleRate);
+    writeUint32LE(28, byteRate);
+    writeUint16LE(32, blockAlign);
+    writeUint16LE(34, bitsPerSample);
+    writeString(36, 'data');
+    writeUint32LE(40, totalDataLen);
+
+    final out = Uint8List(header.length + pcm.length);
+    out.setAll(0, header);
+    out.setAll(header.length, pcm);
+    return out;
+  }
+
+  void _playAudioWeb(Uint8List bytes, String mimeType) {
+    if (!kIsWeb) {
+      // Non-web: best-effort download until a cross-platform audio player is added
+      _downloadBytes(bytes, 'tts.wav', mimeType);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Saved TTS audio (no in-app player on this platform).'),
+        ),
+      );
+      return;
+    }
+    try {
+      if (_lastAudioObjectUrl != null) {
+        html.Url.revokeObjectUrl(_lastAudioObjectUrl!);
+        _lastAudioObjectUrl = null;
+      }
+      final blob = html.Blob([bytes], mimeType);
+      final url = html.Url.createObjectUrlFromBlob(blob);
+      _lastAudioObjectUrl = url;
+      final audio = html.AudioElement(url)
+        ..autoplay = true
+        ..controls = false
+        ..loop = false;
+      // Add element to DOM to ensure playback policies are satisfied after user gesture
+      html.document.body?.append(audio);
+      audio.onEnded.listen((_) {
+        audio.remove();
+        if (_lastAudioObjectUrl != null) {
+          html.Url.revokeObjectUrl(_lastAudioObjectUrl!);
+          _lastAudioObjectUrl = null;
+        }
+      });
+      audio.play();
+    } catch (e) {
+      // Fallback: download if playback fails
+      _downloadBytes(bytes, 'tts.wav', mimeType);
+    }
+  }
+
+  void _downloadBytes(Uint8List data, String filename, String mime) {
+    if (!kIsWeb) return;
+    try {
+      final blob = html.Blob([data], mime);
+      final url = html.Url.createObjectUrlFromBlob(blob);
+      final anchor = html.AnchorElement(href: url)
+        ..download = filename
+        ..style.display = 'none';
+      html.document.body?.append(anchor);
+      anchor.click();
+      anchor.remove();
+      html.Url.revokeObjectUrl(url);
+    } catch (_) {}
+  }
+
   // Saves the PNG passed to the LLM as a downloaded file (Web only).
   void _savePngForVerification(Uint8List pngBytes, int pageNumber) {
     if (!kIsWeb) return;
@@ -482,6 +696,13 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 ? null
                 : () => _transcribeCurrentPage(),
             icon: const Icon(Icons.text_snippet_outlined),
+          ),
+          IconButton(
+            tooltip: 'Speak current page',
+            onPressed: _doc == null || _isSpeaking
+                ? null
+                : () => _speakCurrentPage(),
+            icon: const Icon(Icons.volume_up_outlined),
           ),
           IconButton(
             tooltip: 'Transcribe all pages',
