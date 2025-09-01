@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 from clients import get_client
+from google import genai
 from pdf_renderer import render_pdf_to_images
 from transcriber import transcribe_page
 from tts import text_to_speech_openai, text_to_speech_gemini
@@ -25,8 +26,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--max-pages", type=int, default=None, help="Limit number of pages for processing (for testing)")
     parser.add_argument(
         "--transcription-model",
-        default="gpt-5",
-        help="Model to use for page transcription (default: gpt-5)",
+        default="gemini-2.0-flash",
+        help="Model to use for page transcription (default: gemini-2.0-flash)",
     )
     parser.add_argument("--tts-model", default=None, help="Model to use for text-to-speech")
     parser.add_argument(
@@ -53,7 +54,10 @@ def main() -> None:
     if args.output is None:
         args.output = "output.wav" if args.tts_engine == "gemini" else "output.mp3"
 
-    client = get_client()
+    # OpenAI client remains for optional OpenAI TTS use.
+    oa_client = get_client()
+    # Use Google AI (Gemini) for page transcription.
+    transcribe_client = genai.Client()
 
     images = render_pdf_to_images(args.pdf, debug_folder=args.debug_folder)
 
@@ -73,7 +77,8 @@ def main() -> None:
         print(f"Transcribing {total_pages} page(s) in parallel...")
     with ThreadPoolExecutor(max_workers=min(8, max(1, total_pages))) as ex:
         future_to_idx = {
-            ex.submit(transcribe_page, img, client, args.transcription_model, idx): idx for idx, img in pages
+            ex.submit(transcribe_page, img, transcribe_client, args.transcription_model, idx): idx
+            for idx, img in pages
         }
         for fut in as_completed(future_to_idx):
             idx = future_to_idx[fut]
@@ -103,7 +108,7 @@ def main() -> None:
     if args.tts_engine == "openai":
         tts_model = tts_model or "gpt-4o-mini-tts"
         voice = voice or "onyx"
-        tts_client = client
+        tts_client = oa_client
         tts_func = text_to_speech_openai
     else:
         from google import genai
@@ -150,4 +155,3 @@ def main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     main()
-
