@@ -5,22 +5,11 @@ import 'dart:ui' as ui;
 import 'dart:typed_data';
 
 // Firebase AI (Gemini) setup
-import 'package:firebase_core/firebase_core.dart';
-import 'package:firebase_ai/firebase_ai.dart' as fai;
-import 'firebase_options.dart';
-
-Future<void> _initFirebase() async {
-  try {
-    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  } catch (_) {
-    // If firebase_options.dart is not configured, initialization may fail at runtime.
-    // We handle this gracefully in the UI.
-  }
-}
+import 'package:http/http.dart' as http;
+import 'dart:convert';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await _initFirebase();
   runApp(const MyApp());
 }
 
@@ -122,18 +111,6 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       _transcribedText = null;
     });
     try {
-      // Guard: Firebase must be initialized for FirebaseAI to work on Web.
-      if (Firebase.apps.isEmpty) {
-        throw StateError(
-          'Firebase not initialized. Run `flutterfire config` to generate lib/firebase_options.dart, '
-          'then rebuild and try again.',
-        );
-      }
-      // Ensure Firebase was initialized; FirebaseAI relies on it.
-      // If not, this will likely throw. We surface a friendly error.
-      final model = fai.FirebaseAI.googleAI()
-          .generativeModel(model: 'gemini-2.0-flash');
-
       final prompt =
           'Transcribe the text from this page of a PDF in natural reading order. '
           'Return only the plain text. Summarize figure and figure captions instead '
@@ -143,45 +120,86 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           'Transcribe verbatim except for previously described exceptions.';
 
       final png = await _currentPageAsPngBytes(context);
-
-      final resp = await model.generateContent([
-        fai.Content.text(prompt),
-        fai.Content.inlineData('image/png', png),
-      ]);
-
-      final text = resp.text ?? '';
+      final text = await _geminiVisionGenerate(png, prompt);
       if (!mounted) return;
       setState(() {
         _transcribedText = text.trim();
       });
-    } on FirebaseException catch (e) {
-      if (!mounted) return;
-      final msg = 'Firebase error: \'${e.code}\' ${e.message ?? ''}'.trim();
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Transcription failed: $msg')),
-      );
-    } on UnsupportedError catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Firebase options missing. Run `flutterfire config` to generate firebase_options.dart.'),
-        ),
-      );
     } on StateError catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(e.message ?? 'Firebase not initialized.')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(e.message)));
     } catch (e) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('Transcription failed: $e')),
-      );
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Transcription failed: $e')));
     } finally {
       if (mounted) {
         setState(() => _isTranscribing = false);
       }
     }
+  }
+
+  // Calls the Gemini REST API over HTTP with an image and prompt.
+  Future<String> _geminiVisionGenerate(
+    Uint8List pngBytes,
+    String prompt,
+  ) async {
+    const apiKey = String.fromEnvironment('GENAI_API_KEY');
+    if (apiKey.isEmpty) {
+      throw StateError(
+        'GENAI_API_KEY not set. Run with --dart-define=GENAI_API_KEY=YOUR_KEY',
+      );
+    }
+
+    final url = Uri.parse(
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
+    );
+
+    final payload = {
+      'contents': [
+        {
+          'role': 'user',
+          'parts': [
+            {'text': prompt},
+            {
+              'inline_data': {
+                'mime_type': 'image/png',
+                'data': base64Encode(pngBytes),
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    final resp = await http.post(
+      url,
+      headers: {'Content-Type': 'application/json'},
+      body: jsonEncode(payload),
+    );
+
+    if (resp.statusCode != 200) {
+      throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
+    }
+
+    final Map<String, dynamic> data =
+        jsonDecode(resp.body) as Map<String, dynamic>;
+    final candidates = data['candidates'] as List?;
+    if (candidates == null || candidates.isEmpty) return '';
+    final content =
+        (candidates.first as Map<String, dynamic>)['content']
+            as Map<String, dynamic>?;
+    final parts = content?['parts'] as List?;
+    if (parts == null) return '';
+    final buffer = StringBuffer();
+    for (final p in parts) {
+      final t = (p as Map)['text'];
+      if (t is String && t.isNotEmpty) buffer.write(t);
+    }
+    return buffer.toString();
   }
 
   @override
@@ -193,7 +211,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         actions: [
           IconButton(
             tooltip: 'Transcribe current page (Gemini)',
-            onPressed: _doc == null || _isTranscribing ? null : () => _transcribeCurrentPage(),
+            onPressed: _doc == null || _isTranscribing
+                ? null
+                : () => _transcribeCurrentPage(),
             icon: const Icon(Icons.text_snippet_outlined),
           ),
         ],
@@ -249,7 +269,10 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                   ),
                 // Pager controls
                 Padding(
-                  padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 12),
+                  padding: const EdgeInsets.symmetric(
+                    vertical: 8,
+                    horizontal: 12,
+                  ),
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -258,7 +281,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                         children: [
                           IconButton(
                             tooltip: 'Previous',
-                            onPressed: _pageNumber > 1 ? () => _goToPage(_pageNumber - 1) : null,
+                            onPressed: _pageNumber > 1
+                                ? () => _goToPage(_pageNumber - 1)
+                                : null,
                             icon: const Icon(Icons.chevron_left),
                           ),
                           IconButton(
