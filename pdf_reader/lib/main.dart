@@ -256,22 +256,18 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         'output \$${fmt(outputCost)} for $outTok tok; $modelVersion)';
   }
 
-  // Loads the LLM prompt from assets/prompt.md; falls back to a default string
-  // compatible with the previous inline prompt.
+  // Loads the LLM prompt from assets/prompt.md; throws if missing or empty.
   Future<String> _loadPrompt() async {
-    const fallback =
-        'Transcribe the text from this page of a PDF in natural reading order. '
-        'Return only the plain text. Summarize figure and figure captions instead '
-        'of transcribing them verbatim. Transcribe equations so that they can be '
-        'read aloud naturally by a text-to-speech model. Abbreviate author list with et al. '
-        'Skip non-text like arXiv:2502.04307v1 [cs.RO] 6 Feb 2025. '
-        'Transcribe verbatim except for previously described exceptions.';
     try {
       final s = await rootBundle.loadString('assets/prompt.md');
       final trimmed = s.trim();
-      return trimmed.isEmpty ? fallback : trimmed;
-    } catch (_) {
-      return fallback;
+      if (trimmed.isEmpty) {
+        throw StateError('Prompt asset assets/prompt.md is empty.');
+      }
+      return trimmed;
+    } catch (e) {
+      // Surface a clear error so the caller shows a snackbar.
+      throw StateError('Failed to load prompt from assets/prompt.md: $e');
     }
   }
 
