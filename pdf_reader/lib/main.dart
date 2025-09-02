@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/foundation.dart' show kIsWeb;
 import 'package:flutter/foundation.dart' as foundation;
 import 'package:pdf_render/pdf_render.dart';
+import 'package:file_picker/file_picker.dart';
 import 'dart:ui' as ui;
 import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle;
@@ -45,6 +46,7 @@ class PdfPageImageScreen extends StatefulWidget {
 class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   PdfDocument? _doc;
   int _pageNumber = 1;
+  String _docName = 'example.pdf';
   bool _isTranscribing = false;
   bool _isSpeaking = false;
   bool _isBulkTranscribing = false;
@@ -119,10 +121,56 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     setState(() {
       _doc = doc;
       _pageNumber = 1;
+      _docName = 'example.pdf';
       _pageTexts = List<String?>.filled(doc.pageCount, null);
       _pageCostSummaries = List<String?>.filled(doc.pageCount, null);
       _bulkTotalCostSummary = null;
     });
+  }
+
+  Future<void> _pickAndOpenDocument() async {
+    try {
+      final result = await FilePicker.platform.pickFiles(
+        type: FileType.custom,
+        allowedExtensions: const ['pdf'],
+        withData: kIsWeb, // get bytes on Web
+      );
+      if (result == null || result.files.isEmpty) return;
+      final picked = result.files.first;
+
+      PdfDocument doc;
+      if (kIsWeb) {
+        final bytes = picked.bytes;
+        if (bytes == null) {
+          throw Exception('No file bytes returned.');
+        }
+        doc = await PdfDocument.openData(bytes);
+      } else {
+        final path = picked.path;
+        if (path == null) {
+          throw Exception('No file path returned.');
+        }
+        doc = await PdfDocument.openFile(path);
+      }
+
+      final old = _doc;
+      setState(() {
+        _doc = doc;
+        _pageNumber = 1;
+        _docName = picked.name.isNotEmpty ? picked.name : 'Document.pdf';
+        _pageTexts = List<String?>.filled(doc.pageCount, null);
+        _pageCostSummaries = List<String?>.filled(doc.pageCount, null);
+        _bulkTotalCostSummary = null;
+      });
+      old?.dispose();
+      // Stop any in-progress audio when switching docs
+      await _audioPlayer.stop();
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Failed to open PDF: $e')));
+    }
   }
 
   @override
@@ -372,7 +420,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$apiKey',
+      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
     );
 
     final payload = {
@@ -390,6 +438,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           ],
         },
       ],
+      'generationConfig': {
+        'thinkingConfig': {
+          'thinkingBudget': -1,
+        },
+      },
     };
 
     final resp = await http.post(
@@ -411,10 +464,22 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final Map<String, dynamic> data =
         jsonDecode(resp.body) as Map<String, dynamic>;
     final candidates = data['candidates'] as List?;
-    final content = candidates == null || candidates.isEmpty
+    final firstCandidate =
+        candidates != null && candidates.isNotEmpty
+            ? candidates.first as Map<String, dynamic>
+            : null;
+
+    // If the model finished early due to recitation, surface a clear error.
+    final finishReason = firstCandidate?['finishReason'] as String?;
+    if (finishReason == 'RECITATION') {
+      throw StateError(
+        'Generation finished early due to recitation. Please try again or adjust the prompt.',
+      );
+    }
+
+    final content = firstCandidate == null
         ? null
-        : (candidates.first as Map<String, dynamic>)['content']
-              as Map<String, dynamic>?;
+        : firstCandidate['content'] as Map<String, dynamic>?;
     final parts = content?['parts'] as List?;
     final buffer = StringBuffer();
     if (parts != null) {
@@ -675,8 +740,13 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final doc = _doc;
     return Scaffold(
       appBar: AppBar(
-        title: const Text('PDF → Page Image'),
+        title: Text('PDF → Page Image — $_docName'),
         actions: [
+          IconButton(
+            tooltip: 'Open PDF',
+            icon: const Icon(Icons.folder_open),
+            onPressed: _pickAndOpenDocument,
+          ),
           IconButton(
             tooltip: 'Transcribe current page (Gemini)',
             onPressed: _doc == null || _isTranscribing || _isBulkTranscribing
@@ -862,7 +932,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                       Row(
                         children: [
                           IconButton(
-                            tooltip: _audioState == PlayerState.playing ? 'Pause' : 'Play',
+                            tooltip: _audioState == PlayerState.playing
+                                ? 'Pause'
+                                : 'Play',
                             onPressed: (_audioDuration > Duration.zero)
                                 ? _audioTogglePlayPause
                                 : null,
@@ -878,10 +950,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                                   .clamp(0, _audioDuration.inMilliseconds)
                                   .toDouble(),
                               min: 0,
-                              max: (_audioDuration.inMilliseconds == 0
-                                      ? 1
-                                      : _audioDuration.inMilliseconds)
-                                  .toDouble(),
+                              max:
+                                  (_audioDuration.inMilliseconds == 0
+                                          ? 1
+                                          : _audioDuration.inMilliseconds)
+                                      .toDouble(),
                               onChanged: (_audioDuration > Duration.zero)
                                   ? (v) => _audioSeek(v / 1000.0)
                                   : null,
