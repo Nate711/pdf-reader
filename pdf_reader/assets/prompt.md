@@ -24,6 +24,7 @@ Extract the readable text from a single PDF page image in natural reading order 
 11. Abbreviate author lists with “[first author] et al.” Ignore author affiliations like "BAIR, UC Berkeley"
 12. Exclude obvious boilerplate like submission timestamps or repository IDs unless central to the text’s meaning.
 13. References: omit all reference entries and report only the number of references in the section.
+14. Do not recite training data
 
 ## Special Handling
 - Bulleted/numbered lists: keep list structure as plain text (use “- ” or numbers) when clear.
