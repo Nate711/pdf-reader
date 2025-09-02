@@ -48,7 +48,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   int _pageNumber = 1;
   String _docName = 'example.pdf';
   // Selectable vision model for transcription
-  String _visionModel = 'gemini-2.5-pro';
+  String _visionModel = 'gemini-2.5-flash';
   bool _isTranscribing = false;
   bool _isSpeaking = false;
   bool _isBulkTranscribing = false;
@@ -188,10 +188,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         content: Text(message),
         duration: const Duration(days: 1),
         behavior: SnackBarBehavior.floating,
-        action: SnackBarAction(
-          label: 'Dismiss',
-          onPressed: () {},
-        ),
+        action: SnackBarAction(label: 'Dismiss', onPressed: () {}),
       ),
     );
   }
@@ -437,9 +434,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     };
     // Include dynamic thinking for both Pro and Flash
     payload['generationConfig'] = {
-      'thinkingConfig': {
-        'thinkingBudget': -1,
-      },
+      'thinkingConfig': {'thinkingBudget': -1},
     };
 
     final resp = await http.post(
@@ -461,10 +456,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final Map<String, dynamic> data =
         jsonDecode(resp.body) as Map<String, dynamic>;
     final candidates = data['candidates'] as List?;
-    final firstCandidate =
-        candidates != null && candidates.isNotEmpty
-            ? candidates.first as Map<String, dynamic>
-            : null;
+    final firstCandidate = candidates != null && candidates.isNotEmpty
+        ? candidates.first as Map<String, dynamic>
+        : null;
 
     // If the model finished early due to recitation, surface a clear error.
     final finishReason = firstCandidate?['finishReason'] as String?;
@@ -530,7 +524,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         'responseModalities': ['AUDIO'],
         'speechConfig': {
           'voiceConfig': {
-            'prebuiltVoiceConfig': {'voiceName': 'Kore'},
+            'prebuiltVoiceConfig': {'voiceName': 'Achernar'},
           },
         },
       },
@@ -749,10 +743,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 setState(() => _visionModel = v);
               },
               items: const [
-                DropdownMenuItem(
-                  value: 'gemini-2.5-pro',
-                  child: Text('Pro'),
-                ),
+                DropdownMenuItem(value: 'gemini-2.5-pro', child: Text('Pro')),
                 DropdownMenuItem(
                   value: 'gemini-2.5-flash',
                   child: Text('Flash'),
