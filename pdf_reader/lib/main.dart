@@ -47,6 +47,8 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   PdfDocument? _doc;
   int _pageNumber = 1;
   String _docName = 'example.pdf';
+  // Selectable vision model for transcription
+  String _visionModel = 'gemini-2.5-pro';
   bool _isTranscribing = false;
   bool _isSpeaking = false;
   bool _isBulkTranscribing = false;
@@ -166,10 +168,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       // Stop any in-progress audio when switching docs
       await _audioPlayer.stop();
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Failed to open PDF: $e')));
+      _showPersistentError('Failed to open PDF: $e');
     }
   }
 
@@ -178,6 +177,23 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     _doc?.dispose();
     _audioPlayer.dispose();
     super.dispose();
+  }
+
+  void _showPersistentError(String message) {
+    if (!mounted) return;
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(message),
+        duration: const Duration(days: 1),
+        behavior: SnackBarBehavior.floating,
+        action: SnackBarAction(
+          label: 'Dismiss',
+          onPressed: () {},
+        ),
+      ),
+    );
   }
 
   Future<ui.Image> _renderPage(BuildContext context) async {
@@ -258,15 +274,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         }
       });
     } on StateError catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(e.message)));
+      _showPersistentError(e.message);
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Transcription failed: $e')));
+      _showPersistentError('Transcription failed: $e');
     } finally {
       if (mounted) {
         setState(() => _isTranscribing = false);
@@ -282,13 +292,8 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         ? (_pageTexts![idx] ?? '')
         : '';
     if (text.isEmpty) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'No transcription available for this page. Transcribe first.',
-          ),
-        ),
+      _showPersistentError(
+        'No transcription available for this page. Transcribe first.',
       );
       return;
     }
@@ -299,10 +304,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       await _audioPlayer.stop();
       await _audioPlayer.play(BytesSource(bytes));
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('TTS failed: $e')));
+      _showPersistentError('TTS failed: $e');
     } finally {
       if (mounted) setState(() => _isSpeaking = false);
     }
@@ -389,15 +391,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         _bulkTotalCostSummary = _formatTotalCost(totalCost, doc.pageCount);
       });
     } on StateError catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text(e.message)));
+      _showPersistentError(e.message);
     } catch (e) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Bulk transcription failed: $e')));
+      _showPersistentError('Bulk transcription failed: $e');
     } finally {
       if (mounted) {
         setState(() {
@@ -420,10 +416,10 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
 
     final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key=$apiKey',
+      'https://generativelanguage.googleapis.com/v1beta/models/$_visionModel:generateContent?key=$apiKey',
     );
 
-    final payload = {
+    final payload = <String, dynamic>{
       'contents': [
         {
           'role': 'user',
@@ -438,10 +434,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           ],
         },
       ],
-      'generationConfig': {
-        'thinkingConfig': {
-          'thinkingBudget': -1,
-        },
+    };
+    // Include dynamic thinking for both Pro and Flash
+    payload['generationConfig'] = {
+      'thinkingConfig': {
+        'thinkingBudget': -1,
       },
     };
 
@@ -742,6 +739,27 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       appBar: AppBar(
         title: Text('PDF → Page Image — $_docName'),
         actions: [
+          // Model selector
+          DropdownButtonHideUnderline(
+            child: DropdownButton<String>(
+              value: _visionModel,
+              alignment: Alignment.center,
+              onChanged: (v) {
+                if (v == null) return;
+                setState(() => _visionModel = v);
+              },
+              items: const [
+                DropdownMenuItem(
+                  value: 'gemini-2.5-pro',
+                  child: Text('Pro'),
+                ),
+                DropdownMenuItem(
+                  value: 'gemini-2.5-flash',
+                  child: Text('Flash'),
+                ),
+              ],
+            ),
+          ),
           IconButton(
             tooltip: 'Open PDF',
             icon: const Icon(Icons.folder_open),
