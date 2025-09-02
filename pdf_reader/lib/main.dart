@@ -62,11 +62,14 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   Duration _audioPosition = Duration.zero;
   Duration _audioDuration = Duration.zero;
   PlayerState _audioState = PlayerState.stopped;
+  // Scroll controller for the transcript Scrollbar/SingleChildScrollView
+  late final ScrollController _transcriptScrollController;
 
   @override
   void initState() {
     super.initState();
     _openDocument();
+    _transcriptScrollController = ScrollController();
     _audioPlayer = AudioPlayer();
     _audioPlayer.onDurationChanged.listen((d) {
       if (!mounted) return;
@@ -175,6 +178,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   @override
   void dispose() {
     _doc?.dispose();
+    _transcriptScrollController.dispose();
     _audioPlayer.dispose();
     super.dispose();
   }
@@ -393,6 +397,14 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       setState(() {
         _bulkTotalCostSummary = _formatTotalCost(totalCost, doc.pageCount);
       });
+
+      // Download combined transcript as a single text file (Web best-effort)
+      final combined = results
+          .map((r) => (r['text'] as String))
+          .join("\n\n");
+      final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
+      final filename = '${baseName}_pages_1-${doc.pageCount}.txt';
+      _downloadTextAsFile(combined, filename);
     } on StateError catch (e) {
       _showPersistentError(e.message);
     } catch (e) {
@@ -404,6 +416,163 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         });
       }
     }
+  }
+
+  Future<void> _transcribePageRange(int startPage, int endPage) async {
+    final doc = _doc;
+    if (doc == null) return;
+
+    // Normalize and validate range
+    int start = startPage;
+    int end = endPage;
+    if (start > end) {
+      final t = start;
+      start = end;
+      end = t;
+    }
+    start = start.clamp(1, doc.pageCount);
+    end = end.clamp(1, doc.pageCount);
+    final count = (end - start + 1);
+    if (count <= 0) {
+      _showPersistentError('Invalid page range.');
+      return;
+    }
+
+    setState(() {
+      _isBulkTranscribing = true;
+      _bulkProgress = 0;
+      _bulkTotal = count;
+      _bulkTotalCostSummary = null;
+      // Ensure per-page arrays are present and sized for this doc
+      _pageTexts ??= List<String?>.filled(doc.pageCount, null);
+      _pageCostSummaries ??= List<String?>.filled(doc.pageCount, null);
+      if (_pageTexts!.length != doc.pageCount) {
+        _pageTexts = List<String?>.filled(doc.pageCount, null);
+      }
+      if (_pageCostSummaries!.length != doc.pageCount) {
+        _pageCostSummaries = List<String?>.filled(doc.pageCount, null);
+      }
+    });
+
+    try {
+      final prompt = await _loadPrompt();
+      if (!mounted) return;
+
+      final futures = <Future<Map<String, dynamic>>>[];
+      for (var p = start; p <= end; p++) {
+        Future<Map<String, dynamic>> task() async {
+          final png = await _pageAsPngBytes(context, p);
+          _savePngForVerification(png, p);
+          final result = await _geminiVisionGenerate(png, prompt);
+          return {
+            'page': p,
+            'text': (result['text'] as String).trim(),
+            'totalCost': (result['totalCost'] as double?) ?? 0.0,
+            'costSummary': result['costSummary'] as String?,
+          };
+        }
+
+        final future = task().whenComplete(() {
+          if (!mounted) return;
+          setState(() {
+            _bulkProgress += 1;
+          });
+        });
+        futures.add(future);
+      }
+
+      final results = await Future.wait(futures);
+      results.sort((a, b) => (a['page'] as int).compareTo(b['page'] as int));
+
+      double totalCost = 0.0;
+      for (final r in results) {
+        final p = r['page'] as int;
+        final text = r['text'] as String;
+        final pageCost = r['totalCost'] as double;
+        final costSummary = r['costSummary'] as String?;
+        _pageTexts![p - 1] = text;
+        _pageCostSummaries![p - 1] = costSummary;
+        totalCost += pageCost;
+      }
+
+      if (!mounted) return;
+      setState(() {
+        _bulkTotalCostSummary = _formatTotalCost(totalCost, count);
+      });
+
+      // Download combined transcript as a single text file (Web best-effort)
+      final combined = results
+          .map((r) => (r['text'] as String))
+          .join("\n\n");
+      final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
+      final filename = '${baseName}_pages_${start}-${end}.txt';
+      _downloadTextAsFile(combined, filename);
+    } on StateError catch (e) {
+      _showPersistentError(e.message);
+    } catch (e) {
+      _showPersistentError('Range transcription failed: $e');
+    } finally {
+      if (mounted) {
+        setState(() => _isBulkTranscribing = false);
+      }
+    }
+  }
+
+  Future<void> _showTranscribeRangeDialog() async {
+    final doc = _doc;
+    if (doc == null) return;
+    final startController = TextEditingController(text: '1');
+    final endController = TextEditingController(text: doc.pageCount.toString());
+
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: const Text('Transcribe page range'),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              TextField(
+                controller: startController,
+                keyboardType: TextInputType.number,
+                decoration: const InputDecoration(
+                  labelText: 'Start page',
+                  hintText: 'e.g. 1',
+                ),
+              ),
+              const SizedBox(height: 12),
+              TextField(
+                controller: endController,
+                keyboardType: TextInputType.number,
+                decoration: InputDecoration(
+                  labelText: 'End page (max ${doc.pageCount})',
+                  hintText: doc.pageCount.toString(),
+                ),
+              ),
+            ],
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Cancel'),
+            ),
+            FilledButton(
+              onPressed: () {
+                final s = int.tryParse(startController.text.trim());
+                final e = int.tryParse(endController.text.trim());
+                if (s == null || e == null) {
+                  _showPersistentError('Enter valid page numbers.');
+                  return;
+                }
+                Navigator.of(context).pop();
+                _transcribePageRange(s, e);
+              },
+              child: const Text('Transcribe'),
+            ),
+          ],
+        );
+      },
+    );
   }
 
   // Calls the Gemini REST API over HTTP with an image and prompt.
@@ -672,6 +841,17 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
   }
 
+  // Saves a text string as a .txt download (Web only).
+  void _downloadTextAsFile(String text, String filename) {
+    if (!kIsWeb) return;
+    try {
+      final bytes = Uint8List.fromList(utf8.encode(text));
+      _downloadBytesAsFile(bytes, filename, 'text/plain');
+    } catch (_) {
+      // Best-effort only.
+    }
+  }
+
   Map<String, dynamic> _computeCosts(
     Map<String, dynamic> usage,
     String modelVersion,
@@ -805,6 +985,13 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 : () => _transcribeAllPages(),
             icon: const Icon(Icons.library_books_outlined),
           ),
+          IconButton(
+            tooltip: 'Transcribe page range',
+            onPressed: _doc == null || _isBulkTranscribing || _isTranscribing
+                ? null
+                : () => _showTranscribeRangeDialog(),
+            icon: const Icon(Icons.filter_alt_outlined),
+          ),
         ],
       ),
       body: doc == null
@@ -895,7 +1082,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                             child: SizedBox(
                               height: 200,
                               child: Scrollbar(
+                                controller: _transcriptScrollController,
                                 child: SingleChildScrollView(
+                                  controller: _transcriptScrollController,
                                   child: SelectableText(
                                     text,
                                     style: const TextStyle(fontSize: 14),
