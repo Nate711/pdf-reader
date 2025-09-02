@@ -298,8 +298,14 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     try {
       final audio = await _geminiTts(text);
       final bytes = audio['bytes'] as Uint8List;
+      final mimeType = (audio['mimeType'] as String?) ?? 'audio/wav';
       await _audioPlayer.stop();
       await _audioPlayer.play(BytesSource(bytes));
+      // Also offer the audio as a download to the user (Web best-effort)
+      final baseName =
+          _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
+      final filename = '${baseName}_page_${_pageNumber.toString().padLeft(3, '0')}.wav';
+      _downloadBytesAsFile(bytes, filename, mimeType);
     } catch (e) {
       _showPersistentError('TTS failed: $e');
     } finally {
@@ -641,6 +647,28 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       html.Url.revokeObjectUrl(url);
     } catch (_) {
       // Best-effort: ignore failures (e.g., not running on the web).
+    }
+  }
+
+  // Saves arbitrary bytes as a downloaded file for the user (Web only).
+  void _downloadBytesAsFile(
+    Uint8List bytes,
+    String filename,
+    String mimeType,
+  ) {
+    if (!kIsWeb) return; // Non-web: no-op for now.
+    try {
+      final blob = html.Blob([bytes], mimeType);
+      final url = html.Url.createObjectUrlFromBlob(blob);
+      final anchor = html.AnchorElement(href: url)
+        ..download = filename
+        ..style.display = 'none';
+      html.document.body?.append(anchor);
+      anchor.click();
+      anchor.remove();
+      html.Url.revokeObjectUrl(url);
+    } catch (_) {
+      // Best-effort only.
     }
   }
 
