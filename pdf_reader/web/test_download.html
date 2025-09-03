@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Download Test</title>
+</head>
+<body>
+    <h1>Test Download</h1>
+    <button onclick="testDownload()">Test Download</button>
+    
+    <script>
+        function testDownload() {
+            console.log('Testing download...');
+            
+            // Create test audio data (simple WAV header + silence)
+            const wavHeader = new Uint8Array([
+                0x52, 0x49, 0x46, 0x46, // RIFF
+                0x24, 0x00, 0x00, 0x00, // File size
+                0x57, 0x41, 0x56, 0x45, // WAVE
+                0x66, 0x6d, 0x74, 0x20, // fmt 
+                0x10, 0x00, 0x00, 0x00, // Chunk size
+                0x01, 0x00, 0x02, 0x00, // PCM, stereo
+                0x44, 0xac, 0x00, 0x00, // Sample rate 44100
+                0x10, 0xb1, 0x02, 0x00, // Byte rate
+                0x04, 0x00, 0x10, 0x00, // Block align, bits per sample
+                0x64, 0x61, 0x74, 0x61, // data
+                0x00, 0x00, 0x00, 0x00  // Data size
+            ]);
+            
+            const blob = new Blob([wavHeader], { type: 'audio/wav' });
+            const url = URL.createObjectURL(blob);
+            
+            const anchor = document.createElement('a');
+            anchor.href = url;
+            anchor.download = 'test.wav';
+            anchor.style.display = 'none';
+            
+            document.body.appendChild(anchor);
+            anchor.click();
+            document.body.removeChild(anchor);
+            
+            setTimeout(() => {
+                URL.revokeObjectURL(url);
+            }, 100);
+            
+            console.log('Download should have been triggered');
+        }
+    </script>
+</body>
+</html>

@@ -19,6 +19,8 @@ class DownloadHelper {
 
   // Saves arbitrary bytes as a file
   static Future<void> downloadBytesAsFile(Uint8List bytes, String filename, String mimeType) async {
+    _logger.i('downloadBytesAsFile called: $filename, ${bytes.length} bytes, $mimeType, web: $kIsWeb');
+    
     if (kIsWeb) {
       try {
         _logger.d('Downloading file on web platform: $filename (${bytes.length} bytes, $mimeType)');
@@ -26,6 +28,7 @@ class DownloadHelper {
         _logger.i('Web download initiated: $filename');
       } catch (e) {
         _logger.e('Failed to download file on web', error: e);
+        rethrow;
       }
     } else {
       try {
@@ -36,6 +39,7 @@ class DownloadHelper {
         _logger.i('Saved file to: $filePath');
       } catch (e) {
         _logger.e('Failed to save file', error: e);
+        rethrow;
       }
     }
   }
