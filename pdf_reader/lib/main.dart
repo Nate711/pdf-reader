@@ -58,7 +58,6 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   // Debug toggle: download page render PNGs sent to LLM
   bool _downloadVerificationPngs = false;
   bool _isTranscribing = false;
-  bool _isSpeaking = false;
   bool _isStreamingSpeaking = false;
   bool _isBulkTranscribing = false;
   int _bulkProgress = 0;
@@ -355,37 +354,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     }
   }
 
-  Future<void> _speakCurrentPage() async {
-    final doc = _doc;
-    if (doc == null) return;
-    final idx = (_pageNumber - 1).clamp(0, (doc.pageCount - 1));
-    final text = (_pageTexts != null && idx < _pageTexts!.length)
-        ? (_pageTexts![idx] ?? '')
-        : '';
-    if (text.isEmpty) {
-      _showPersistentError(
-        'No transcription available for this page. Transcribe first.',
-      );
-      return;
-    }
-    setState(() => _isSpeaking = true);
-    try {
-      final audio = await _geminiTts(text);
-      final bytes = audio['bytes'] as Uint8List;
-      final mimeType = (audio['mimeType'] as String?) ?? 'audio/wav';
-      await _audioPlayer.stop();
-      await _audioPlayer.play(BytesSource(bytes));
-      // Also offer the audio as a download to the user (Web best-effort)
-      final baseName =
-          _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
-      final filename = '${baseName}_page_${_pageNumber.toString().padLeft(3, '0')}.wav';
-      _downloadBytesAsFile(bytes, filename, mimeType);
-    } catch (e) {
-      _showPersistentError('TTS failed: $e');
-    } finally {
-      if (mounted) setState(() => _isSpeaking = false);
-    }
-  }
+  // Removed non-WebSocket TTS path
 
   // Audio controls for the in-app player (audioplayers)
   Future<void> _audioTogglePlayPause() async {
@@ -748,86 +717,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     };
   }
 
-  // Gemini TTS over HTTP. Returns { bytes: Uint8List, mimeType: String }
-  Future<Map<String, dynamic>> _geminiTts(String text) async {
-    const apiKey = String.fromEnvironment('GENAI_API_KEY');
-    if (apiKey.isEmpty) {
-      throw StateError(
-        'GENAI_API_KEY not set. Run with --dart-define=GENAI_API_KEY=YOUR_KEY',
-      );
-    }
-    // Use preview TTS-capable model.
-    final url = Uri.parse(
-      'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash-preview-tts:generateContent?key=$apiKey',
-    );
-    final payload = {
-      'contents': [
-        {
-          'parts': [
-            {'text': text},
-          ],
-        },
-      ],
-      'generationConfig': {
-        'responseModalities': ['AUDIO'],
-        'speechConfig': {
-          'voiceConfig': {
-            'prebuiltVoiceConfig': {'voiceName': 'Achernar'},
-          },
-        },
-      },
-      'model': 'gemini-2.5-flash-preview-tts',
-    };
-    if (foundation.kDebugMode) {
-      foundation.debugPrint('Gemini TTS request: ${jsonEncode(payload)}');
-    }
-    final resp = await http.post(
-      url,
-      headers: {'Content-Type': 'application/json'},
-      body: jsonEncode(payload),
-    );
-    if (foundation.kDebugMode) {
-      foundation.debugPrint('Gemini TTS status: ${resp.statusCode}');
-      foundation.debugPrint('Gemini TTS body: ${resp.body}');
-    }
-    if (resp.statusCode != 200) {
-      throw Exception('HTTP ${resp.statusCode}: ${resp.body}');
-    }
-    final Map<String, dynamic> data =
-        jsonDecode(resp.body) as Map<String, dynamic>;
-    final candidates = data['candidates'] as List?;
-    if (candidates == null || candidates.isEmpty) {
-      throw Exception('No audio in response');
-    }
-    final content =
-        (candidates.first as Map<String, dynamic>)['content']
-            as Map<String, dynamic>;
-    final parts = content['parts'] as List?;
-    if (parts == null || parts.isEmpty) {
-      throw Exception('No parts in response');
-    }
-    for (final p in parts) {
-      final mp = p as Map<String, dynamic>;
-      // REST may return camelCase inlineData
-      final inline =
-          (mp['inlineData'] as Map<String, dynamic>?) ??
-          (mp['inline_data'] as Map<String, dynamic>?);
-      if (inline != null) {
-        final base64 = inline['data'] as String?;
-        if (base64 != null) {
-          final pcm = Uint8List.fromList(const Base64Decoder().convert(base64));
-          final wav = _pcmToWav(
-            pcm,
-            sampleRate: 24000,
-            channels: 1,
-            bitsPerSample: 16,
-          );
-          return {'bytes': wav, 'mimeType': 'audio/wav'};
-        }
-      }
-    }
-    throw Exception('No inline audio found');
-  }
+  // Removed non-WebSocket TTS path
 
   // Streaming TTS over WebSockets using Gemini live preview.
   // Accumulates audio chunks and returns a WAV payload when complete.
@@ -845,8 +735,12 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     // NOTE: This endpoint path reflects the Gemini Live/Realtime WebSocket.
     // If Google updates the path, adjust accordingly.
     final url = Uri.parse(
-      'wss://generativelanguage.googleapis.com/v1beta/models/$model:connect?key=$apiKey',
+      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey',
     );
+
+    if (foundation.kDebugMode) {
+      foundation.debugPrint('Connecting WS to: $url');
+    }
 
     final channel = WebSocketChannel.connect(url);
 
@@ -854,25 +748,42 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     final collected = BytesBuilder();
     final done = Completer<void>();
 
-    // Send initial config specifying audio response.
-    final configMsg = jsonEncode({
-      'config': {
-        'responseModalities': ['AUDIO'],
-        'speechConfig': {
-          'voiceConfig': {
-            'prebuiltVoiceConfig': {'voiceName': 'Achernar'},
-          },
-        },
-      },
-      'model': model,
+    // Send initial setup specifying model and audio response.
+    final setupMsg = jsonEncode({
+      'setup': {
+        'model': 'models/$model',
+        'generationConfig': {
+          'responseModalities': ['AUDIO'],
+          'speechConfig': {
+            'voiceConfig': {
+              'prebuiltVoiceConfig': {
+                'voiceName': 'Achernar',
+              }
+            }
+          }
+        }
+      }
     });
-    channel.sink.add(configMsg);
+    channel.sink.add(setupMsg);
 
-    // Send the text prompt as a turn.
-    final inputMsg = jsonEncode({
-      'text': text,
-    });
-    channel.sink.add(inputMsg);
+    // Buffer client messages until setupComplete.
+    bool setupComplete = false;
+    void sendClientTurn() {
+      final msg = jsonEncode({
+        'clientContent': {
+          'turns': [
+            {
+              'role': 'user',
+              'parts': [
+                {'text': text}
+              ]
+            }
+          ],
+          'turnComplete': true,
+        }
+      });
+      channel.sink.add(msg);
+    }
 
     // Listen for streamed responses.
     channel.stream.listen(
@@ -887,21 +798,50 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           final str = event.toString();
           final Map<String, dynamic> msg = jsonDecode(str);
 
-          // If message contains base64 audio chunk
-          final data = msg['data'] as String?;
-          if (data != null) {
-            final bytes = base64Decode(data);
-            collected.add(bytes);
-            // Play progressively on web via WebAudio
-            if (kIsWeb) {
-              _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
-            }
+          // Wait for setupComplete before sending our turn.
+          if (!setupComplete && msg.containsKey('setupComplete')) {
+            setupComplete = true;
+            sendClientTurn();
+            return;
           }
 
-          // Turn completion indication
+          // Extract audio chunks from serverContent.modelTurn.parts[*]
           final serverContent = msg['serverContent'] as Map<String, dynamic>?;
-          if (serverContent != null && serverContent['turnComplete'] == true) {
-            if (!done.isCompleted) done.complete();
+          if (serverContent != null) {
+            final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
+            final parts = modelTurn != null ? modelTurn['parts'] as List? : null;
+            if (parts != null) {
+              for (final p in parts) {
+                final mp = (p as Map).cast<String, dynamic>();
+                Map<String, dynamic>? inline =
+                    (mp['inlineData'] as Map<String, dynamic>?) ??
+                    (mp['inline_data'] as Map<String, dynamic>?);
+                String? mime;
+                String? b64;
+                if (inline != null) {
+                  mime = inline['mimeType'] as String? ?? inline['mime_type'] as String?;
+                  b64 = inline['data'] as String?;
+                } else if (mp['audio'] is Map<String, dynamic>) {
+                  final a = mp['audio'] as Map<String, dynamic>;
+                  mime = a['mimeType'] as String? ?? a['mime_type'] as String?;
+                  b64 = a['data'] as String?;
+                }
+                if (b64 != null) {
+                  final bytes = base64Decode(b64);
+                  collected.add(bytes);
+                  if (kIsWeb) {
+                    _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
+                  }
+                }
+              }
+            }
+
+            final genComplete = serverContent['generationComplete'] == true;
+            final turnComplete = serverContent['turnComplete'] == true;
+            if (genComplete || turnComplete) {
+              if (!done.isCompleted) done.complete();
+              return;
+            }
           }
         } catch (_) {
           // Ignore malformed frames; continue until turnComplete/close.
@@ -1023,7 +963,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     return out;
   }
 
-  // Download helper (currently unused)
+  // Download helpers
 
   // Saves the PNG passed to the LLM as a downloaded file (Web only).
   void _savePngForVerification(Uint8List pngBytes, int pageNumber) {
@@ -1195,13 +1135,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 : () => _transcribeCurrentPage(),
             icon: const Icon(Icons.text_snippet_outlined),
           ),
-          IconButton(
-            tooltip: 'Speak current page',
-            onPressed: _doc == null || _isSpeaking
-                ? null
-                : () => _speakCurrentPage(),
-            icon: const Icon(Icons.volume_up_outlined),
-          ),
+          // Removed non-WebSocket TTS button
           IconButton(
             tooltip: 'Speak (streaming TTS)',
             onPressed: _doc == null || _isStreamingSpeaking
