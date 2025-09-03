@@ -4,16 +4,22 @@ import 'package:flutter/foundation.dart' as foundation;
 import 'package:pdf_render/pdf_render.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:ui' as ui;
+import 'dart:async';
 import 'dart:typed_data';
 import 'package:flutter/services.dart' show rootBundle;
 // For web download of verification images
 // ignore: avoid_web_libraries_in_flutter, deprecated_member_use
 import 'dart:html' as html;
+// WebAudio API (for Flutter Web streaming playback)
+// ignore: avoid_web_libraries_in_flutter
+import 'dart:web_audio' as webaudio;
 
 // Firebase AI (Gemini) setup
 import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'package:audioplayers/audioplayers.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
+import 'package:web_socket_channel/status.dart' as ws_status;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -49,8 +55,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   String _docName = 'example.pdf';
   // Selectable vision model for transcription
   String _visionModel = 'gemini-2.5-flash';
+  // Debug toggle: download page render PNGs sent to LLM
+  bool _downloadVerificationPngs = false;
   bool _isTranscribing = false;
   bool _isSpeaking = false;
+  bool _isStreamingSpeaking = false;
   bool _isBulkTranscribing = false;
   int _bulkProgress = 0;
   int _bulkTotal = 0;
@@ -64,6 +73,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   PlayerState _audioState = PlayerState.stopped;
   // Scroll controller for the transcript Scrollbar/SingleChildScrollView
   late final ScrollController _transcriptScrollController;
+  // WebAudio playback state for progressive streaming (web only)
+  webaudio.AudioContext? _webAudioCtx;
+  double _webAudioNextStart = 0.0;
 
   @override
   void initState() {
@@ -83,6 +95,60 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       if (!mounted) return;
       setState(() => _audioState = s);
     });
+  }
+
+  // Schedules a PCM s16le chunk to play via WebAudio immediately after
+  // the last scheduled buffer finishes (Web only). Safe no-op off web.
+  void _webaudioSchedulePcmChunk(
+    Uint8List pcmBytes, {
+    required int sampleRate,
+    required int channels,
+  }) {
+    if (!kIsWeb) return;
+    try {
+      _webAudioCtx ??= webaudio.AudioContext();
+      final ctx = _webAudioCtx!;
+      // Convert s16le PCM to Float32 [-1, 1]
+      final sampleCount = pcmBytes.length ~/ 2;
+      final floats = Float32List(sampleCount);
+      final bd = ByteData.view(pcmBytes.buffer, pcmBytes.offsetInBytes, pcmBytes.length);
+      for (var i = 0; i < sampleCount; i++) {
+        final s = bd.getInt16(i * 2, Endian.little);
+        floats[i] = (s >= 0 ? s / 32767.0 : s / 32768.0);
+      }
+
+      // For mono only (channels == 1). If multi-channel support is needed later,
+      // we can deinterleave here.
+      final frameCount = sampleCount ~/ channels;
+      final buffer = ctx.createBuffer(channels, frameCount, sampleRate);
+      if (channels == 1) {
+        buffer.getChannelData(0).setRange(0, frameCount, floats);
+      } else {
+        // Naive split for 2 channels if ever needed
+        for (var ch = 0; ch < channels; ch++) {
+          final chData = buffer.getChannelData(ch);
+          var w = 0;
+          for (var r = ch; r < sampleCount; r += channels) {
+            chData[w++] = floats[r];
+          }
+        }
+      }
+
+      final src = ctx.createBufferSource();
+      src.buffer = buffer;
+      final dest = ctx.destination;
+      if (dest != null) {
+        src.connectNode(dest);
+      }
+
+      final now = (ctx.currentTime ?? 0).toDouble();
+      // Start in a tiny future to avoid pops, and after any prior chunk.
+      final startAt = (_webAudioNextStart > now ? _webAudioNextStart : now) + 0.03;
+      src.start(startAt);
+      _webAudioNextStart = startAt + (frameCount / sampleRate);
+    } catch (_) {
+      // best-effort only
+    }
   }
 
   // Encodes a ui.Image to PNG bytes, optionally flipping vertically
@@ -180,6 +246,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     _doc?.dispose();
     _transcriptScrollController.dispose();
     _audioPlayer.dispose();
+    try {
+      _webAudioCtx?.close();
+    } catch (_) {}
     super.dispose();
   }
 
@@ -261,8 +330,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       if (!mounted) return;
 
       final png = await _currentPageAsPngBytes(context);
-      // Download the exact PNG sent to the LLM for orientation verification (Web only)
-      _savePngForVerification(png, _pageNumber);
+      if (_downloadVerificationPngs) {
+        _savePngForVerification(png, _pageNumber);
+      }
       final result = await _geminiVisionGenerate(png, prompt);
       if (!mounted) return;
       setState(() {
@@ -353,8 +423,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       for (var p = 1; p <= doc.pageCount; p++) {
         Future<Map<String, dynamic>> task() async {
           final png = await _pageAsPngBytes(context, p);
-          // Download the exact PNG sent to the LLM for orientation verification (Web only)
-          _savePngForVerification(png, p);
+          if (_downloadVerificationPngs) {
+            _savePngForVerification(png, p);
+          }
           final result = await _geminiVisionGenerate(png, prompt);
           return {
             'page': p,
@@ -462,7 +533,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       for (var p = start; p <= end; p++) {
         Future<Map<String, dynamic>> task() async {
           final png = await _pageAsPngBytes(context, p);
-          _savePngForVerification(png, p);
+          if (_downloadVerificationPngs) {
+            _savePngForVerification(png, p);
+          }
           final result = await _geminiVisionGenerate(png, prompt);
           return {
             'page': p,
@@ -756,6 +829,157 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     throw Exception('No inline audio found');
   }
 
+  // Streaming TTS over WebSockets using Gemini live preview.
+  // Accumulates audio chunks and returns a WAV payload when complete.
+  Future<Map<String, dynamic>> _geminiTtsStream(String text) async {
+    const apiKey = String.fromEnvironment('GENAI_API_KEY');
+    if (apiKey.isEmpty) {
+      throw StateError(
+        'GENAI_API_KEY not set. Run with --dart-define=GENAI_API_KEY=YOUR_KEY',
+      );
+    }
+
+    // Live preview model for streaming audio output.
+    const model = 'gemini-2.5-flash-live-preview';
+
+    // NOTE: This endpoint path reflects the Gemini Live/Realtime WebSocket.
+    // If Google updates the path, adjust accordingly.
+    final url = Uri.parse(
+      'wss://generativelanguage.googleapis.com/v1beta/models/$model:connect?key=$apiKey',
+    );
+
+    final channel = WebSocketChannel.connect(url);
+
+    // Collect PCM i16 samples from streamed messages.
+    final collected = BytesBuilder();
+    final done = Completer<void>();
+
+    // Send initial config specifying audio response.
+    final configMsg = jsonEncode({
+      'config': {
+        'responseModalities': ['AUDIO'],
+        'speechConfig': {
+          'voiceConfig': {
+            'prebuiltVoiceConfig': {'voiceName': 'Achernar'},
+          },
+        },
+      },
+      'model': model,
+    });
+    channel.sink.add(configMsg);
+
+    // Send the text prompt as a turn.
+    final inputMsg = jsonEncode({
+      'text': text,
+    });
+    channel.sink.add(inputMsg);
+
+    // Listen for streamed responses.
+    channel.stream.listen(
+      (event) {
+        try {
+          if (event is List<int>) {
+            // Some implementations may send raw PCM frames. Append as-is.
+            collected.add(event);
+            return;
+          }
+
+          final str = event.toString();
+          final Map<String, dynamic> msg = jsonDecode(str);
+
+          // If message contains base64 audio chunk
+          final data = msg['data'] as String?;
+          if (data != null) {
+            final bytes = base64Decode(data);
+            collected.add(bytes);
+            // Play progressively on web via WebAudio
+            if (kIsWeb) {
+              _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
+            }
+          }
+
+          // Turn completion indication
+          final serverContent = msg['serverContent'] as Map<String, dynamic>?;
+          if (serverContent != null && serverContent['turnComplete'] == true) {
+            if (!done.isCompleted) done.complete();
+          }
+        } catch (_) {
+          // Ignore malformed frames; continue until turnComplete/close.
+        }
+      },
+      onError: (e) {
+        if (!done.isCompleted) {
+          done.completeError(Exception('WebSocket error: $e'));
+        }
+      },
+      onDone: () {
+        if (!done.isCompleted) done.complete();
+      },
+    );
+
+    // Wait for end of turn or socket close
+    await done.future.timeout(const Duration(minutes: 2));
+
+    // Close politely
+    try {
+      channel.sink.close(ws_status.normalClosure);
+    } catch (_) {}
+
+    final pcm = collected.takeBytes();
+    if (pcm.isEmpty) {
+      throw Exception('No audio received from streaming TTS');
+    }
+
+    // The live preview outputs 24kHz s16le PCM.
+    final wav = _pcmToWav(
+      Uint8List.fromList(pcm),
+      sampleRate: 24000,
+      channels: 1,
+      bitsPerSample: 16,
+    );
+    return {'bytes': wav, 'mimeType': 'audio/wav'};
+  }
+
+  Future<void> _speakCurrentPageStreaming() async {
+    final doc = _doc;
+    if (doc == null) return;
+    final idx = (_pageNumber - 1).clamp(0, (doc.pageCount - 1));
+    final text = (_pageTexts != null && idx < _pageTexts!.length)
+        ? (_pageTexts![idx] ?? '')
+        : '';
+    if (text.isEmpty) {
+      _showPersistentError(
+        'No transcription available for this page. Transcribe first.',
+      );
+      return;
+    }
+    setState(() => _isStreamingSpeaking = true);
+    try {
+      if (kIsWeb) {
+        _webAudioCtx ??= webaudio.AudioContext();
+        _webAudioNextStart = (_webAudioCtx!.currentTime ?? 0).toDouble();
+      }
+      final audio = await _geminiTtsStream(text);
+      final bytes = audio['bytes'] as Uint8List;
+      final mimeType = (audio['mimeType'] as String?) ?? 'audio/wav';
+      // On web, audio has already been playing progressively.
+      // On non-web, play the combined result at the end.
+      if (!kIsWeb) {
+        await _audioPlayer.stop();
+        await _audioPlayer.play(BytesSource(bytes));
+      }
+      // Offer download
+      final baseName =
+          _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
+      final filename = '${baseName}_page_${_pageNumber.toString().padLeft(3, '0')}_stream.wav';
+      _downloadBytesAsFile(bytes, filename, mimeType);
+    } catch (e) {
+      _showPersistentError('Streaming TTS failed: $e');
+    } finally {
+      if (mounted) setState(() => _isStreamingSpeaking = false);
+    }
+  }
+
   // Wrap raw PCM (s16le) into a WAV container for easy playback in browsers.
   Uint8List _pcmToWav(
     Uint8List pcm, {
@@ -979,6 +1203,13 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
             icon: const Icon(Icons.volume_up_outlined),
           ),
           IconButton(
+            tooltip: 'Speak (streaming TTS)',
+            onPressed: _doc == null || _isStreamingSpeaking
+                ? null
+                : () => _speakCurrentPageStreaming(),
+            icon: const Icon(Icons.multitrack_audio_outlined),
+          ),
+          IconButton(
             tooltip: 'Transcribe all pages',
             onPressed: _doc == null || _isBulkTranscribing || _isTranscribing
                 ? null
@@ -991,6 +1222,20 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 ? null
                 : () => _showTranscribeRangeDialog(),
             icon: const Icon(Icons.filter_alt_outlined),
+          ),
+          // Toggle download of verification PNGs (Web)
+          IconButton(
+            tooltip: _downloadVerificationPngs
+                ? 'Download page PNGs: ON'
+                : 'Download page PNGs: OFF',
+            onPressed: () {
+              setState(() => _downloadVerificationPngs = !_downloadVerificationPngs);
+            },
+            icon: Icon(
+              _downloadVerificationPngs
+                  ? Icons.image
+                  : Icons.image_not_supported_outlined,
+            ),
           ),
         ],
       ),
