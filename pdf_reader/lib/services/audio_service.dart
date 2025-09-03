@@ -1,7 +1,11 @@
 import 'package:audioplayers/audioplayers.dart';
 import 'dart:async';
+import 'dart:typed_data';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:logger/logger.dart';
 
 class AudioService {
+  static final Logger _logger = Logger();
   final AudioPlayer _audioPlayer = AudioPlayer();
   final StreamController<Duration> _positionController = StreamController<Duration>.broadcast();
   final StreamController<Duration> _durationController = StreamController<Duration>.broadcast();
@@ -37,7 +41,28 @@ class AudioService {
   }
 
   Future<void> play(Source source) async {
-    await _audioPlayer.play(source);
+    try {
+      if (kIsWeb) {
+        _logger.d('Playing audio on web platform');
+      }
+      await _audioPlayer.play(source);
+    } catch (e) {
+      _logger.e('Failed to play audio: $e');
+      rethrow;
+    }
+  }
+
+  Future<void> playAudioBytes(Uint8List audioBytes, {String mimeType = 'audio/wav'}) async {
+    try {
+      if (kIsWeb) {
+        _logger.d('Playing audio bytes on web platform (${audioBytes.length} bytes, type: $mimeType)');
+      }
+      final source = BytesSource(audioBytes);
+      await play(source);
+    } catch (e) {
+      _logger.e('Failed to play audio bytes: $e');
+      rethrow;
+    }
   }
 
   Future<void> pause() async {

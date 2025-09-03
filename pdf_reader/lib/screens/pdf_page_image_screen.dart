@@ -422,7 +422,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       
       // Play audio using the audio service
       await _audioService.stop();
-      await _audioService.play(BytesSource(bytes));
+      await _audioService.playAudioBytes(bytes, mimeType: mimeType);
       
       // Save audio file
       final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
