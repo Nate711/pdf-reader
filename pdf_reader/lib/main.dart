@@ -20,6 +20,7 @@ import 'dart:convert';
 import 'package:audioplayers/audioplayers.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 import 'package:web_socket_channel/status.dart' as ws_status;
+import 'package:web_socket_channel/io.dart' as io_ws;
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -76,6 +77,23 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   webaudio.AudioContext? _webAudioCtx;
   double _webAudioNextStart = 0.0;
 
+  // Lightweight logging helper that prints to Flutter console and browser console.
+  void _log(String message) {
+    try {
+      // ignore: avoid_print
+      print(message);
+    } catch (_) {}
+    try {
+      foundation.debugPrint(message);
+    } catch (_) {}
+    if (kIsWeb) {
+      try {
+        // ignore: deprecated_member_use
+        html.window.console.log(message);
+      } catch (_) {}
+    }
+  }
+
   @override
   void initState() {
     super.initState();
@@ -110,7 +128,11 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       // Convert s16le PCM to Float32 [-1, 1]
       final sampleCount = pcmBytes.length ~/ 2;
       final floats = Float32List(sampleCount);
-      final bd = ByteData.view(pcmBytes.buffer, pcmBytes.offsetInBytes, pcmBytes.length);
+      final bd = ByteData.view(
+        pcmBytes.buffer,
+        pcmBytes.offsetInBytes,
+        pcmBytes.length,
+      );
       for (var i = 0; i < sampleCount; i++) {
         final s = bd.getInt16(i * 2, Endian.little);
         floats[i] = (s >= 0 ? s / 32767.0 : s / 32768.0);
@@ -142,7 +164,8 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
 
       final now = (ctx.currentTime ?? 0).toDouble();
       // Start in a tiny future to avoid pops, and after any prior chunk.
-      final startAt = (_webAudioNextStart > now ? _webAudioNextStart : now) + 0.03;
+      final startAt =
+          (_webAudioNextStart > now ? _webAudioNextStart : now) + 0.03;
       src.start(startAt);
       _webAudioNextStart = startAt + (frameCount / sampleRate);
     } catch (_) {
@@ -439,9 +462,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       });
 
       // Download combined transcript as a single text file (Web best-effort)
-      final combined = results
-          .map((r) => (r['text'] as String))
-          .join("\n\n");
+      final combined = results.map((r) => (r['text'] as String)).join("\n\n");
       final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
       final filename = '${baseName}_pages_1-${doc.pageCount}.txt';
       _downloadTextAsFile(combined, filename);
@@ -543,9 +564,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
       });
 
       // Download combined transcript as a single text file (Web best-effort)
-      final combined = results
-          .map((r) => (r['text'] as String))
-          .join("\n\n");
+      final combined = results.map((r) => (r['text'] as String)).join("\n\n");
       final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
       final filename = '${baseName}_pages_${start}-${end}.txt';
       _downloadTextAsFile(combined, filename);
@@ -732,23 +751,33 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
     // Live preview model for streaming audio output.
     const model = 'gemini-2.5-flash-live-preview';
 
-    // NOTE: This endpoint path reflects the Gemini Live/Realtime WebSocket.
-    // If Google updates the path, adjust accordingly.
-    final url = Uri.parse(
-      'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=$apiKey',
+    // Build WebSocket endpoint per Live API reference using API key.
+    // Build URL per pattern:
+    // url = `${websocketBaseUrl}/ws/google.ai.generativelanguage.${apiVersion}.GenerativeService.${method}?${keyName}=${apiKey}`
+    const websocketBaseUrl = 'wss://generativelanguage.googleapis.com';
+    const apiVersion = 'v1beta';
+    const method = 'BidiGenerateContent';
+    const keyName = 'key';
+    final wsUrlWithKey = Uri.parse(
+      '$websocketBaseUrl/ws/google.ai.generativelanguage.$apiVersion.GenerativeService.$method?$keyName=$apiKey',
+    );
+    final wsUrlNoKey = Uri.parse(
+      '$websocketBaseUrl/ws/google.ai.generativelanguage.$apiVersion.GenerativeService.$method',
     );
 
-    if (foundation.kDebugMode) {
-      foundation.debugPrint('Connecting WS to: $url');
-    }
+    _log(
+      'Live WS: connecting to ' +
+          (kIsWeb ? wsUrlWithKey.toString() : wsUrlNoKey.toString()),
+    );
 
-    final channel = WebSocketChannel.connect(url);
-
-    // Collect PCM i16 samples from streamed messages.
+    const protocols = ['json'];
+    // Shared collectors and setup payload
     final collected = BytesBuilder();
     final done = Completer<void>();
+    int _msgCount = 0;
+    int _audioChunks = 0;
+    int _audioBytes = 0;
 
-    // Send initial setup specifying model and audio response.
     final setupMsg = jsonEncode({
       'setup': {
         'model': 'models/$model',
@@ -756,56 +785,102 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
           'responseModalities': ['AUDIO'],
           'speechConfig': {
             'voiceConfig': {
-              'prebuiltVoiceConfig': {
-                'voiceName': 'Achernar',
-              }
-            }
-          }
-        }
-      }
+              'prebuiltVoiceConfig': {'voiceName': 'Achernar'},
+            },
+          },
+        },
+      },
     });
-    channel.sink.add(setupMsg);
 
-    // Buffer client messages until setupComplete.
-    bool setupComplete = false;
-    void sendClientTurn() {
-      final msg = jsonEncode({
-        'clientContent': {
-          'turns': [
-            {
-              'role': 'user',
-              'parts': [
-                {'text': text}
-              ]
-            }
-          ],
-          'turnComplete': true,
-        }
+    if (kIsWeb) {
+      // Web-specific implementation using dart:html for richer diagnostics.
+      final ws = html.WebSocket(wsUrlWithKey.toString(), protocols);
+      ws.binaryType = 'arraybuffer';
+      final open = Completer<void>();
+      ws.onOpen.first.then((_) {
+        _log('Live WS: onOpen');
+        open.complete();
       });
-      channel.sink.add(msg);
-    }
+      ws.onError.first.then((e) {
+        if (!open.isCompleted) open.completeError(Exception('WS open error'));
+      });
 
-    // Listen for streamed responses.
-    channel.stream.listen(
-      (event) {
+      await open.future.timeout(const Duration(seconds: 10));
+
+      // Send setup
+      _log('Live WS: sending setup -> ' + setupMsg);
+      ws.sendString(setupMsg);
+
+      // State and handlers
+      bool setupComplete = false;
+
+      void sendClientTurn() {
+        final msg = jsonEncode({
+          'clientContent': {
+            'turns': [
+              {
+                'role': 'user',
+                'parts': [
+                  {'text': text},
+                ],
+              },
+            ],
+            'turnComplete': true,
+          },
+        });
+        _log('Live WS: sending clientContent (turnComplete=true)');
+        ws.sendString(msg);
+      }
+
+      ws.onMessage.listen((event) {
         try {
-          if (event is List<int>) {
-            // Some implementations may send raw PCM frames. Append as-is.
-            collected.add(event);
+          if (event.data is ByteBuffer) {
+            final bb = event.data as ByteBuffer;
+            final bytes = Uint8List.view(bb);
+            collected.add(bytes);
+            _audioChunks++;
+            _audioBytes += bytes.length;
+            if (_audioChunks % 5 == 1) {
+              _log('Live WS: binary audio frame bytes=${bytes.length} total=$_audioBytes');
+            }
             return;
           }
-
-          final str = event.toString();
+          final str = event.data?.toString() ?? '';
+          _log('Live WS: text frame len=${str.length}');
           final Map<String, dynamic> msg = jsonDecode(str);
+          _log('Live WS: keys=${msg.keys.join(', ')}');
 
-          // Wait for setupComplete before sending our turn.
           if (!setupComplete && msg.containsKey('setupComplete')) {
             setupComplete = true;
+            _log('Live WS: setupComplete received. Sending client turn...');
             sendClientTurn();
             return;
           }
 
-          // Extract audio chunks from serverContent.modelTurn.parts[*]
+          final topLevelData = msg['data'];
+          if (topLevelData is String && topLevelData.isNotEmpty) {
+            final bytes = base64Decode(topLevelData);
+            collected.add(bytes);
+            _audioChunks++;
+            _audioBytes += bytes.length;
+            _log('Live WS: audio chunk (top-level data) bytes=${bytes.length} total=$_audioBytes');
+            _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
+          }
+
+          final realtimeOutput = msg['realtimeOutput'] as Map<String, dynamic>?;
+          if (realtimeOutput != null) {
+            final audio = realtimeOutput['audio'] as Map<String, dynamic>?;
+            final b64 = audio != null ? audio['data'] as String? : null;
+            if (b64 != null) {
+              final bytes = base64Decode(b64);
+              collected.add(bytes);
+              _audioChunks++;
+              _audioBytes += bytes.length;
+              _log('Live WS: audio chunk (realtimeOutput) bytes=${bytes.length} total=$_audioBytes');
+              _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
+            }
+          }
+
           final serverContent = msg['serverContent'] as Map<String, dynamic>?;
           if (serverContent != null) {
             final modelTurn = serverContent['modelTurn'] as Map<String, dynamic>?;
@@ -816,22 +891,20 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 Map<String, dynamic>? inline =
                     (mp['inlineData'] as Map<String, dynamic>?) ??
                     (mp['inline_data'] as Map<String, dynamic>?);
-                String? mime;
                 String? b64;
                 if (inline != null) {
-                  mime = inline['mimeType'] as String? ?? inline['mime_type'] as String?;
                   b64 = inline['data'] as String?;
                 } else if (mp['audio'] is Map<String, dynamic>) {
                   final a = mp['audio'] as Map<String, dynamic>;
-                  mime = a['mimeType'] as String? ?? a['mime_type'] as String?;
                   b64 = a['data'] as String?;
                 }
                 if (b64 != null) {
                   final bytes = base64Decode(b64);
                   collected.add(bytes);
-                  if (kIsWeb) {
-                    _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
-                  }
+                  _audioChunks++;
+                  _audioBytes += bytes.length;
+                  _log('Live WS: audio chunk (parts) bytes=${bytes.length} total=$_audioBytes');
+                  _webaudioSchedulePcmChunk(bytes, sampleRate: 24000, channels: 1);
                 }
               }
             }
@@ -839,38 +912,131 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
             final genComplete = serverContent['generationComplete'] == true;
             final turnComplete = serverContent['turnComplete'] == true;
             if (genComplete || turnComplete) {
+              _log('Live WS: genComplete=$genComplete turnComplete=$turnComplete. Ending turn.');
               if (!done.isCompleted) done.complete();
               return;
             }
           }
+        } catch (err, st) {
+          _log('Live WS: error while handling message: $err');
+          _log(st.toString());
+        }
+      });
+
+      ws.onError.listen((e) {
+        _log('Live WS: onError');
+        if (!done.isCompleted) done.completeError(Exception('WebSocket error'));
+      });
+      ws.onClose.listen((event) {
+        try {
+          final ce = event as html.CloseEvent;
+          _log('Live WS: onClose code=${ce.code} reason=${ce.reason} wasClean=${ce.wasClean}');
         } catch (_) {
-          // Ignore malformed frames; continue until turnComplete/close.
+          _log('Live WS: onClose (no details)');
         }
-      },
-      onError: (e) {
-        if (!done.isCompleted) {
-          done.completeError(Exception('WebSocket error: $e'));
-        }
-      },
-      onDone: () {
         if (!done.isCompleted) done.complete();
-      },
-    );
+      });
 
-    // Wait for end of turn or socket close
-    await done.future.timeout(const Duration(minutes: 2));
+      try {
+        await done.future.timeout(const Duration(minutes: 2));
+      } catch (e) {
+        _log('Live WS: timeout waiting for audio/end-of-turn: $e');
+        rethrow;
+      } finally {
+        try {
+          _log('Live WS: closing channel');
+          ws.close();
+        } catch (e) {
+          _log('Live WS: error during close: $e');
+        }
+      }
+    } else {
+      // Non-web: use web_socket_channel with header auth
+      final channel = io_ws.IOWebSocketChannel.connect(
+        wsUrlNoKey,
+        protocols: protocols,
+        headers: {'x-goog-api-key': apiKey},
+      );
+      // Send initial setup specifying model and audio response.
+      _log('Live WS (native): sending setup -> ' + setupMsg);
+      channel.sink.add(setupMsg);
 
-    // Close politely
-    try {
-      channel.sink.close(ws_status.normalClosure);
-    } catch (_) {}
+      // Buffer client messages until setupComplete.
+      bool setupComplete = false;
+      void sendClientTurn() {
+        final msg = jsonEncode({
+          'clientContent': {
+            'turns': [
+              {
+                'role': 'user',
+                'parts': [
+                  {'text': text},
+                ],
+              },
+            ],
+            'turnComplete': true,
+          },
+        });
+        _log('Live WS (native): sending clientContent (turnComplete=true)');
+        channel.sink.add(msg);
+      }
 
+      channel.stream.listen(
+        (event) {
+          try {
+            if (event is List<int>) {
+              collected.add(event);
+              return;
+            }
+            final str = event.toString();
+            final Map<String, dynamic> msg = jsonDecode(str);
+            if (!setupComplete && msg.containsKey('setupComplete')) {
+              setupComplete = true;
+              sendClientTurn();
+              return;
+            }
+            final serverContent = msg['serverContent'] as Map<String, dynamic>?;
+            final parts = (serverContent?['modelTurn'] as Map<String, dynamic>?)?['parts'] as List?;
+            if (parts != null) {
+              for (final p in parts) {
+                final mp = (p as Map).cast<String, dynamic>();
+                final inline = (mp['inlineData'] as Map<String, dynamic>?) ?? (mp['inline_data'] as Map<String, dynamic>?);
+                final b64 = inline != null
+                    ? inline['data'] as String?
+                    : (mp['audio'] is Map<String, dynamic>)
+                        ? (mp['audio'] as Map<String, dynamic>)['data'] as String?
+                        : null;
+                if (b64 != null) collected.add(base64Decode(b64));
+              }
+            }
+            final genComplete = serverContent?['generationComplete'] == true;
+            final turnComplete = serverContent?['turnComplete'] == true;
+            if (genComplete || turnComplete) {
+              if (!done.isCompleted) done.complete();
+              return;
+            }
+          } catch (_) {}
+        },
+        onError: (e) {
+          if (!done.isCompleted) done.completeError(Exception('WebSocket error: $e'));
+        },
+        onDone: () {
+          if (!done.isCompleted) done.complete();
+        },
+      );
+
+      await done.future.timeout(const Duration(minutes: 2));
+      try {
+        channel.sink.close(ws_status.normalClosure);
+      } catch (_) {}
+    }
+    // Finalize audio buffer and return
     final pcm = collected.takeBytes();
     if (pcm.isEmpty) {
+      _log('Live WS: completed with 0 audio bytes. messages=$_msgCount chunks=$_audioChunks');
       throw Exception('No audio received from streaming TTS');
     }
 
-    // The live preview outputs 24kHz s16le PCM.
     final wav = _pcmToWav(
       Uint8List.fromList(pcm),
       sampleRate: 24000,
@@ -909,9 +1075,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
         await _audioPlayer.play(BytesSource(bytes));
       }
       // Offer download
-      final baseName =
-          _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
-      final filename = '${baseName}_page_${_pageNumber.toString().padLeft(3, '0')}_stream.wav';
+      final baseName = _docName.replaceFirst(RegExp(r'\.[Pp][Dd][Ff]$'), '');
+      final filename =
+          '${baseName}_page_${_pageNumber.toString().padLeft(3, '0')}_stream.wav';
       _downloadBytesAsFile(bytes, filename, mimeType);
     } catch (e) {
       _showPersistentError('Streaming TTS failed: $e');
@@ -984,11 +1150,7 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
   }
 
   // Saves arbitrary bytes as a downloaded file for the user (Web only).
-  void _downloadBytesAsFile(
-    Uint8List bytes,
-    String filename,
-    String mimeType,
-  ) {
+  void _downloadBytesAsFile(Uint8List bytes, String filename, String mimeType) {
     if (!kIsWeb) return; // Non-web: no-op for now.
     try {
       final blob = html.Blob([bytes], mimeType);
@@ -1163,7 +1325,9 @@ class _PdfPageImageScreenState extends State<PdfPageImageScreen> {
                 ? 'Download page PNGs: ON'
                 : 'Download page PNGs: OFF',
             onPressed: () {
-              setState(() => _downloadVerificationPngs = !_downloadVerificationPngs);
+              setState(
+                () => _downloadVerificationPngs = !_downloadVerificationPngs,
+              );
             },
             icon: Icon(
               _downloadVerificationPngs
