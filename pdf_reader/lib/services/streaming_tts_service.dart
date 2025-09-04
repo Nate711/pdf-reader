@@ -20,9 +20,18 @@ class StreamingTtsService {
       throw Exception('Text cannot be empty');
     }
 
-    _logger.i('Starting TTS conversion for text: "${text.substring(0, text.length.clamp(0, 50))}..."');
+    _logger.i('Starting TTS conversion for text (${text.length} chars)');
+    _logger.i('Text preview: "${text.substring(0, text.length.clamp(0, 100))}..."');
+    if (text.length > 100) {
+      _logger.i('Text ending: "...${text.substring(text.length - 50)}"');
+    }
 
-    return await _generateTtsViaWebSocket(text, apiKey);
+    // Create explicit TTS prompt
+    final ttsPrompt = 'Please read the following text aloud verbatim, word for word, without any commentary or explanation. Just speak the text exactly as written:\n\n$text';
+    
+    _logger.i('TTS prompt created (${ttsPrompt.length} chars total)');
+
+    return await _generateTtsViaWebSocket(ttsPrompt, apiKey);
   }
 
   Future<Map<String, dynamic>> _generateTtsViaWebSocket(String text, String apiKey) async {
@@ -67,6 +76,12 @@ class StreamingTtsService {
                 setupComplete = true;
                 _logger.i('Setup completed, sending text message...');
                 
+                // Log the exact text being sent
+                _logger.i('Text being sent to Gemini (${text.length} chars):');
+                _logger.i('--- START TEXT ---');
+                _logger.i(text);
+                _logger.i('--- END TEXT ---');
+                
                 // Send text message for TTS
                 final textMsg = jsonEncode({
                   'clientContent': {
@@ -82,15 +97,33 @@ class StreamingTtsService {
                   }
                 });
                 
+                _logger.i('JSON message size: ${textMsg.length} chars');
+                _logger.d('Full JSON message: $textMsg');
+                
                 channel!.sink.add(textMsg);
               } else if (json.containsKey('serverContent')) {
                 // Handle audio response
+                _logger.i('Received serverContent response');
                 final serverContent = json['serverContent'];
+                _logger.d('ServerContent keys: ${serverContent.keys.join(', ')}');
+                
                 if (serverContent.containsKey('modelTurn')) {
                   final modelTurn = serverContent['modelTurn'];
+                  _logger.d('ModelTurn keys: ${modelTurn.keys.join(', ')}');
+                  
                   if (modelTurn.containsKey('parts')) {
                     final parts = modelTurn['parts'] as List;
-                    for (final part in parts) {
+                    _logger.i('Found ${parts.length} parts in modelTurn');
+                    
+                    for (int i = 0; i < parts.length; i++) {
+                      final part = parts[i];
+                      _logger.d('Part $i keys: ${part.keys.join(', ')}');
+                      
+                      if (part.containsKey('text')) {
+                        final responseText = part['text'];
+                        _logger.w('Gemini sent text response instead of audio: "$responseText"');
+                      }
+                      
                       if (part.containsKey('inlineData')) {
                         final inlineData = part['inlineData'];
                         final audioData = inlineData['data'] as String;
@@ -110,6 +143,8 @@ class StreamingTtsService {
                       }
                     }
                   }
+                } else {
+                  _logger.w('ServerContent without modelTurn: ${serverContent.toString()}');
                 }
               } else if (json.containsKey('error')) {
                 _logger.e('WebSocket error: ${json['error']}');
@@ -153,19 +188,22 @@ class StreamingTtsService {
       channel.sink.add(setupMsg);
       
       // Wait for completion with timeout
-      await completer.future.timeout(const Duration(seconds: 15));
+      _logger.i('Waiting for audio response...');
+      await completer.future.timeout(const Duration(seconds: 20));
       
       final pcmData = collected.takeBytes();
+      _logger.i('Collected ${pcmData.length} bytes of raw audio data');
+      
       if (pcmData.isEmpty) {
-        throw Exception('No audio data received from WebSocket');
+        throw Exception('No audio data received from Gemini Live. The response may have been text-only.');
       }
       
-      _logger.i('Received ${pcmData.length} bytes of PCM data');
+      _logger.i('Converting ${pcmData.length} bytes of PCM data to WAV...');
       
       // Convert PCM to WAV (24kHz, mono, 16-bit as indicated by Python test)
       final wav = pcmToWav(Uint8List.fromList(pcmData), sampleRate: 24000, channels: 1, bitsPerSample: 16);
       
-      _logger.i('Generated WAV file: ${wav.length} bytes');
+      _logger.i('Successfully generated WAV file: ${wav.length} bytes total');
       return {'bytes': wav, 'mimeType': 'audio/wav'};
       
     } finally {
